@@ -1,0 +1,8 @@
+customtkinter
+google-generativeai
+requests
+openai-whisper
+srt
+pysubs2
+numpy
+google-api-core
