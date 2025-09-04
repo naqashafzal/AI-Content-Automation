@@ -191,50 +191,51 @@ def sanitize_for_tts(text:str)->str:
     return text.replace('“','"').replace('”','"').replace('’',"'").replace('—','-').replace('–','-')
 
 def add_fillers_to_script(script: str, probability: float) -> str:
-    """Adds conversational fillers to the script's dialogue based on a given probability."""
-    # Fillers without parentheses so the TTS engine speaks them
-    fillers = [
+    """Adds conversational fillers and strategic pauses to the script's dialogue."""
+    # Fillers that the TTS engine will speak
+    spoken_fillers = [
         'umm', 'ah', 'you know', 'I mean', 'hmm', 'like', 'so', 'actually',
         'basically', 'right', 'well', 'anyway', 'sort of', 'kind of', 'I guess'
     ]
     # Non-verbal cues that should remain in parentheses
-    non_verbal_fillers = ['(laugh)', '(cough)']
+    non_verbal_fillers = ['(laugh)', '(cough)', '(gasp)', '(sigh)', '(chuckle)']
+    # Punctuation fillers for strategic pauses
+    punctuation_fillers = [',', '...', '-', ';']
 
-    all_fillers = fillers + non_verbal_fillers
+    all_fillers = spoken_fillers + non_verbal_fillers + punctuation_fillers
+
     lines = script.split('\n')
     new_lines = []
 
     for line in lines:
         stripped_line = line.strip()
-        # A speaker line is now reliably identified by the "**Name:**" pattern.
-        # This is the key fix.
         is_speaker_line = ':**' in stripped_line and len(stripped_line.split(':**', 1)[0]) < 30
 
-        # Only attempt to add a filler if it's a speaker line
         if is_speaker_line and random.random() < probability:
             filler = random.choice(all_fillers)
 
-            # Split the line into the speaker part and the dialogue part
             try:
                 speaker_part, dialogue_part = stripped_line.split(':**', 1)
-                speaker_part += ':**'  # Add the delimiter back
+                speaker_part += ':**'
             except ValueError:
-                new_lines.append(line)  # Failsafe
+                new_lines.append(line)
                 continue
 
             words = dialogue_part.strip().split()
             if len(words) > 1:
-                # Insert the filler at a natural position within the dialogue
                 insert_pos = random.randint(1, len(words) - 1)
-                words.insert(insert_pos, filler)
-                
-                # Reconstruct the full line
-                new_line = speaker_part + ' ' + ' '.join(words)
+
+                if filler in punctuation_fillers:
+                    words[insert_pos - 1] += filler
+                    new_line = speaker_part + ' ' + ' '.join(words)
+                else:
+                    words.insert(insert_pos, filler)
+                    new_line = speaker_part + ' ' + ' '.join(words)
+
                 new_lines.append(new_line)
             else:
-                new_lines.append(line)  # Not enough words to insert a filler
+                new_lines.append(line)
         else:
-            # If it's not a speaker line, or the random chance didn't pass, append the original line
             new_lines.append(line)
 
     return '\n'.join(new_lines)
