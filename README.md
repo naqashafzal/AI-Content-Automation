@@ -89,7 +89,12 @@ Includes a polished GUI (built with `customtkinter`) for one-click pipelines, vo
 - Makes AI voices sound less synthetic while keeping content readable and professional.
 
 ---
+## 🧠 Examples
+-<a href="https://www.youtube.com/watch?v=39w6k_QlpqI&ab_channel=RealAmericaOnline" target="_blank">
+    Watch Example Podcast Generated
+  </a>
 
+  ---
 ## ⚙️ Requirements
 
 - **Python 3.9+**  
