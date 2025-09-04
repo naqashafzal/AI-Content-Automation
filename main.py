@@ -14,6 +14,7 @@ import pysubs2
 import os
 import logging
 import numpy as np
+import random
 from functools import wraps
 from google.api_core import exceptions as google_exceptions
 
@@ -33,13 +34,19 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 ])
 
 # ============================
+# THREADING STOP EVENT
+# ============================
+stop_event = threading.Event()
+
+
+# ============================
 # CONFIG
 # ============================
 CONFIG_FILE = "config.json"
 def load_config():
     if os.path.exists(CONFIG_FILE):
         try:
-            with open(CONFIG_FILE,"r",encoding="utf-8") as f: 
+            with open(CONFIG_FILE,"r",encoding="utf-8") as f:
                 config_data = json.load(f)
         except json.JSONDecodeError:
             logging.error("Config file is corrupted. Loading default config.")
@@ -53,6 +60,8 @@ def load_config():
         "SPEAKER1":"Kore",
         "SPEAKER2":"Puck",
         "HOST_NAME":"Alex",
+        "HUMANOID_ENABLED": False,
+        "HUMANOID_PROBABILITY": 0.1,
         "GUEST_NAME":"Maya",
         "HOST_PERSONA":"A friendly podcast host who loves technology.",
         "GUEST_PERSONA":"An expert on the topic with a calm and informative style.",
@@ -76,11 +85,12 @@ def load_config():
     for key, value in default_config.items():
         if key not in config_data:
             config_data[key] = value
-            
+
     return config_data
 
 def save_config(cfg):
     with open(CONFIG_FILE,"w",encoding="utf-8") as f: json.dump(cfg,f,indent=2,ensure_ascii=False)
+
 
 config = load_config()
 genai_client=None
@@ -174,11 +184,60 @@ def sanitize_for_tts(text:str)->str:
         "\U00002600-\U000026FF"  # Miscellaneous Symbols
         "\U00002700-\U000027BF"  # Dingbats
         "]+", re.UNICODE)
-    
+
     text = emoji_pattern.sub(r'', text)
     text = unicodedata.normalize("NFKC", text)
     text = re.sub(r'[ \t\r\f\v]+',' ',text).replace('\xa0',' ').strip()
     return text.replace('“','"').replace('”','"').replace('’',"'").replace('—','-').replace('–','-')
+
+def add_fillers_to_script(script: str, probability: float) -> str:
+    """Adds conversational fillers to the script's dialogue based on a given probability."""
+    # Fillers without parentheses so the TTS engine speaks them
+    fillers = [
+        'umm', 'ah', 'you know', 'I mean', 'hmm', 'like', 'so', 'actually',
+        'basically', 'right', 'well', 'anyway', 'sort of', 'kind of', 'I guess'
+    ]
+    # Non-verbal cues that should remain in parentheses
+    non_verbal_fillers = ['(laugh)', '(cough)']
+
+    all_fillers = fillers + non_verbal_fillers
+    lines = script.split('\n')
+    new_lines = []
+
+    for line in lines:
+        stripped_line = line.strip()
+        # A speaker line is now reliably identified by the "**Name:**" pattern.
+        # This is the key fix.
+        is_speaker_line = ':**' in stripped_line and len(stripped_line.split(':**', 1)[0]) < 30
+
+        # Only attempt to add a filler if it's a speaker line
+        if is_speaker_line and random.random() < probability:
+            filler = random.choice(all_fillers)
+
+            # Split the line into the speaker part and the dialogue part
+            try:
+                speaker_part, dialogue_part = stripped_line.split(':**', 1)
+                speaker_part += ':**'  # Add the delimiter back
+            except ValueError:
+                new_lines.append(line)  # Failsafe
+                continue
+
+            words = dialogue_part.strip().split()
+            if len(words) > 1:
+                # Insert the filler at a natural position within the dialogue
+                insert_pos = random.randint(1, len(words) - 1)
+                words.insert(insert_pos, filler)
+                
+                # Reconstruct the full line
+                new_line = speaker_part + ' ' + ' '.join(words)
+                new_lines.append(new_line)
+            else:
+                new_lines.append(line)  # Not enough words to insert a filler
+        else:
+            # If it's not a speaker line, or the random chance didn't pass, append the original line
+            new_lines.append(line)
+
+    return '\n'.join(new_lines)
 
 def extract_voice_name(val): return val.split(" — ")[0] if " — " in val else val
 
@@ -200,7 +259,7 @@ def check_ffmpeg():
         return True
     except (subprocess.CalledProcessError, FileNotFoundError):
         return False
-        
+
 def generate_captions(audio_file, captions_file):
     """Transcribes an audio file and generates an ASS caption file for dynamic styling.
 
@@ -339,7 +398,7 @@ def generate_captions(audio_file, captions_file):
         log(f"❌ Error during caption generation: {e}")
         return None
 
-    
+
 # ============================
 # GEMINI / WAVESPEED
 # ============================
@@ -376,7 +435,7 @@ def gemini_deep_research(topic:str)->str:
     if not key: raise RuntimeError("Gemini API key missing (Settings tab).")
 
     log("🌐 Using Google Search to find fresh, up-to-date information...")
-    
+
     api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_TEXT_MODEL}:generateContent?key={key}"
     payload={
         "contents":[{"role":"user","parts":[{"text":(
@@ -386,18 +445,18 @@ def gemini_deep_research(topic:str)->str:
         )}]}],
         "tools": [{"google_search": {}}]
     }
-    
+
     try:
         r = requests.post(api_url, json=payload, timeout=120)
         r.raise_for_status()
         response_json = r.json()
-        
+
         text_part = response_json.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text")
         if text_part:
             return text_part
         else:
             raise ValueError("No text content found in Gemini response.")
-    
+
     except Exception as e:
         logging.error(f"Gemini research with search failed: {e}")
         raise RuntimeError("Gemini research with search failed.")
@@ -436,19 +495,19 @@ def generate_seo_metadata(topic: str, research: str):
         return {"title": topic, "description": "", "tags": ""}
 
 @handle_gemini_errors
-def gemini_podcast_script(topic:str, research:str, host_persona:str, guest_persona:str, language:str)->str: # Added language parameter
-    ensure_genai() #
-    host, guest = config.get("HOST_NAME","Alex"), config.get("GUEST_NAME","Maya") #
-    channel=config.get("CHANNEL_NAME","My AI Channel") #
-    sub_count=config.get("SUBSCRIBE_COUNT",3) #
-    sub_message=config.get("SUBSCRIBE_MESSAGE","Don’t forget to subscribe to {channel}!").replace("{channel}",channel) #
-    randomize=config.get("SUBSCRIBE_RANDOM",True) #
-    style=config.get("PODCAST_STYLE","Informative News") #
+def gemini_podcast_script(topic:str, research:str, host_persona:str, guest_persona:str, language:str)->str:
+    ensure_genai()
+    host, guest = config.get("HOST_NAME","Alex"), config.get("GUEST_NAME","Maya")
+    channel=config.get("CHANNEL_NAME","My AI Channel")
+    sub_count=config.get("SUBSCRIBE_COUNT",3)
+    sub_message=config.get("SUBSCRIBE_MESSAGE","Don’t forget to subscribe to {channel}!").replace("{channel}",channel)
+    randomize=config.get("SUBSCRIBE_RANDOM",True)
+    style=config.get("PODCAST_STYLE","Informative News")
 
     placement_instruction = (
-        f"- Insert about {sub_count} reminders randomly and naturally at different points." #
+        f"- Insert about {sub_count} reminders randomly and naturally at different points."
         if randomize else
-        f"- Insert exactly {sub_count} reminders evenly spaced." #
+        f"- Insert exactly {sub_count} reminders evenly spaced."
     )
 
     prompt = f"""
@@ -460,10 +519,11 @@ Format:
 
 {host}: ...
 {guest}: ...
-
 Special instructions:
 - The script should be conversational, as if two people are talking. Avoid long monologues.
-- To make the conversation sound more natural and human, occasionally include conversational fillers and hesitations like 'umm', 'ah', 'you know', 'I mean', and 'hmm'. Use them sparingly where a real person might pause or think.
+- Use contractions like "don't", "it's", and "you're" to sound more natural.
+- Keep sentences relatively short and easy to follow.
+- Allow for occasional incomplete sentences or one speaker finishing the other's thought.
 {placement_instruction}
 - Reminder text: "{sub_message}"
 - End with: "{host}: Thanks for listening! {sub_message}"
@@ -474,9 +534,17 @@ Topic: {topic}
 Research:
 {research}
 """
-    response = genai_client.generate_content(prompt, safety_settings={'HARM_CATEGORY_DANGEROUS_CONTENT': 'BLOCK_NONE'}) #
-    return response.text #
-    
+    response = genai_client.generate_content(prompt, safety_settings={'HARM_CATEGORY_DANGEROUS_CONTENT': 'BLOCK_NONE'})
+    script_content = response.text
+
+    # Check if the humanoid filter is enabled
+    if config.get("HUMANOID_ENABLED", False):
+        log("✍️ Applying humanoid conversational fillers...")
+        humanoid_prob = config.get("HUMANOID_PROBABILITY", 0.1)
+        script_content = add_fillers_to_script(script_content, humanoid_prob)
+
+    return script_content
+
 @handle_gemini_errors
 def gemini_fact_check(script:str)->str:
     ensure_genai()
@@ -575,12 +643,12 @@ def wavespeed_text_to_video(topic: str, video_path) -> str:
     wavespeed_key = config.get("WAVESPEED_AI_KEY", "").strip()
     if not wavespeed_key:
         raise RuntimeError("WaveSpeed AI key missing (Settings tab).")
-    
+
     # Use the custom prompt template from settings, inserting the current topic
     video_prompt_template = config.get("VIDEO_PROMPT_STYLE", "An animated and cinematic video about {topic}.")
     prompt_text = video_prompt_template.format(topic=topic)
     log(f"ℹ️ Using video prompt: \"{prompt_text}\"")
-    
+
     headers={"Content-Type":"application/json", "Authorization":f"Bearer {wavespeed_key}"}
     payload={
       "duration": 5,
@@ -591,17 +659,17 @@ def wavespeed_text_to_video(topic: str, video_path) -> str:
     }
 
     log("▶️ Sending text to WaveSpeed for video generation...")
-    
+
     try:
         # 1. Initial POST request to start the video generation
         initial_response = requests.post(WAVESPEED_T2V_API_URL, headers=headers, json=payload, timeout=120)
         initial_response.raise_for_status()
-        
+
         # The 'id' is inside a 'data' object, as per the official example
         initial_data = initial_response.json().get("data")
         if not initial_data or "id" not in initial_data:
             raise KeyError(f"'id' not found in initial API response. Full response: {initial_response.json()}")
-        
+
         reqid = initial_data["id"]
         log(f"✅ Task submitted successfully. Request ID: {reqid}")
 
@@ -614,7 +682,7 @@ def wavespeed_text_to_video(topic: str, video_path) -> str:
         log("⏱️ Polling for results... (checking every 10 seconds)")
         while time.time() - start_time < timeout_seconds:
             poll_response = requests.get(result_url, headers=poll_headers, timeout=60)
-            
+
             if poll_response.status_code == 200:
                 # The result is always inside a 'data' object
                 result_data = poll_response.json().get("data")
@@ -626,7 +694,7 @@ def wavespeed_text_to_video(topic: str, video_path) -> str:
                 if status == "completed":
                     log("✅ Task completed! Downloading video.")
                     video_url = result_data["outputs"][0]
-                    
+
                     # Download the video
                     video_content = requests.get(video_url).content
                     with open(video_path, "wb") as f:
@@ -638,14 +706,14 @@ def wavespeed_text_to_video(topic: str, video_path) -> str:
                     error_msg = result_data.get('error', 'No details provided.')
                     log(f"❌ Video generation failed: {error_msg}")
                     raise RuntimeError(f"WaveSpeed task failed: {error_msg}")
-                
+
                 else:
                     # e.g., 'queued', 'processing'
                     log(f"⏳ Task status is '{status}'. Waiting...")
 
             else:
                 log(f"⚠️ Polling failed with status {poll_response.status_code}. Retrying...")
-            
+
             time.sleep(10) # Wait 10 seconds before the next poll
 
         # If the loop finishes, it's a timeout
@@ -654,7 +722,7 @@ def wavespeed_text_to_video(topic: str, video_path) -> str:
     except Exception as e:
         logging.error(f"Video generation process failed: {e}", exc_info=True)
         raise RuntimeError(f"Video generation process failed: {e}")
-    
+
 def upload_youtube():
     # Placeholder for YouTube upload logic
     log("▶️ Authenticating and uploading to YouTube...")
@@ -669,7 +737,7 @@ def upload_facebook():
     # Add Facebook Graph API authentication and upload logic here
     # This also involves a complex OAuth 2.0 flow
     messagebox.showinfo("Upload", "Facebook upload functionality not yet implemented.")
-    
+
 def get_history_items():
     history_items = []
     for item in os.listdir('.'):
@@ -693,7 +761,7 @@ def update_history_tab():
 
     ctk.CTkLabel(history_tab_frame, text="History", font=("Arial", 20, "bold")).pack(pady=(20, 10))
     ctk.CTkLabel(history_tab_frame, text="All previously generated podcasts:", font=("Arial", 14)).pack(pady=5)
-    
+
     items = get_history_items()
     if not items:
         ctk.CTkLabel(history_tab_frame, text="No history found.", font=("Arial", 12)).pack(pady=20)
@@ -709,6 +777,7 @@ def update_history_tab():
 # PIPELINE
 # ============================
 def run_pipeline():
+    # This function is now aware of the stop_event
     topic = topic_entry.get().strip()
     if not topic:
         return messagebox.showerror("Error", "Enter a topic first")
@@ -723,21 +792,21 @@ def run_pipeline():
     safe_topic = re.sub(r'[\\/:*?"<>|]', '', topic)
     if not os.path.exists(safe_topic):
         os.makedirs(safe_topic)
-        
+
     SUMMARY_FILE_PATH = os.path.join(safe_topic, "summary.txt")
     SCRIPT_FILE_PATH = os.path.join(safe_topic, "podcast_script.txt")
     AUDIO_FILE_PATH = os.path.join(safe_topic, "podcast.wav")
     BACKGROUND_VIDEO_RAW_PATH = os.path.join(safe_topic, "background.mp4")
     FINAL_VIDEO_PATH = os.path.join(safe_topic, "final_podcast_video.mp4")
     CAPTIONS_FILE_PATH = os.path.join(safe_topic, "captions.ass") # Use .ass format
-    
+
     start_point = start_step_combo.get()
-    
+
     reset_steps()
-    run_button.configure(state="disabled")
-    
+
     try:
         # Step 1: Research
+        if stop_event.is_set(): return
         research = ""
         if start_point == "Deep Research" or not os.path.exists(SUMMARY_FILE_PATH):
             log(f"🔍 Researching: {topic}"); set_step_status(0,"⏳", 0.1)
@@ -748,25 +817,21 @@ def run_pipeline():
             log("➡️ Skipping research step. Using existing summary.")
             research = open(SUMMARY_FILE_PATH, "r", encoding="utf-8").read()
             set_step_status(0,"☑️", 1.0)
-            
+
         # Step 2: Generate SEO Metadata
+        if stop_event.is_set(): return
         if metadata_var.get():
             log("📄 Generating SEO metadata..."); set_step_status(1,"⏳", 0.1)
             metadata = generate_seo_metadata(topic, research)
-            
-            # Pre-populate GUI fields
-            video_title_entry.delete(0, ctk.END)
-            video_title_entry.insert(0, metadata.get("title", topic))
-            video_desc_entry.delete("1.0", ctk.END)
-            video_desc_entry.insert("1.0", metadata.get("description", ""))
-            video_tags_entry.delete(0, ctk.END)
-            video_tags_entry.insert(0, metadata.get("tags", ""))
-            
+            video_title_entry.delete(0, ctk.END); video_title_entry.insert(0, metadata.get("title", topic))
+            video_desc_entry.delete("1.0", ctk.END); video_desc_entry.insert("1.0", metadata.get("description", ""))
+            video_tags_entry.delete(0, ctk.END); video_tags_entry.insert(0, metadata.get("tags", ""))
             set_step_status(1, "✅", 1.0); log("✅ SEO metadata generated and pre-filled.")
         else:
             set_step_status(1, "⏭️", 1.0)
 
         # Step 3: Script
+        if stop_event.is_set(): return
         if start_point == "Podcast Script" or not os.path.exists(SCRIPT_FILE_PATH):
             log("📝 Generating script..."); set_step_status(2,"⏳", 0.1)
             host_p = config.get("HOST_PERSONA"); guest_p = config.get("GUEST_PERSONA")
@@ -777,8 +842,9 @@ def run_pipeline():
             log("➡️ Skipping script generation. Using existing script.")
             script = open(SCRIPT_FILE_PATH, "r", encoding="utf-8").read()
             set_step_status(2,"☑️", 1.0)
-            
+
         # Step 4: Fact Check
+        if stop_event.is_set(): return
         if fact_check_var.get():
             log("🧐 Fact checking script..."); set_step_status(3,"⏳", 0.1)
             fact_check_result = gemini_fact_check(script)
@@ -786,8 +852,9 @@ def run_pipeline():
             set_step_status(3,"✅", 1.0); log("✅ Fact check complete")
         else:
             set_step_status(3, "⏭️", 1.0)
-        
+
         # Step 5: TTS
+        if stop_event.is_set(): return
         if start_point == "Audio (TTS)" or not os.path.exists(AUDIO_FILE_PATH):
             log("🎙️ Generating audio..."); set_step_status(4,"⏳", 0.1)
             audio_path = gemini_tts_generate(script, AUDIO_FILE_PATH, tts_mode_combo.get(), voice_combo.get())
@@ -800,6 +867,7 @@ def run_pipeline():
             set_step_status(4,f"☑️ {audio_len:.1f}s", 1.0)
 
         # Step 6: Caption Generation
+        if stop_event.is_set(): return
         captions_path = None
         if caption_var.get():
             log("✍️ Generating captions..."); set_step_status(5,"⏳", 0.1)
@@ -811,7 +879,8 @@ def run_pipeline():
         else:
             set_step_status(5, "⏭️", 1.0)
 
-      # Step 7: Video Generation
+        # Step 7: Video Generation
+        if stop_event.is_set(): return
         if start_point == "Video Generation" or not os.path.exists(BACKGROUND_VIDEO_RAW_PATH):
             log("🎬 Generating video from text with WaveSpeed..."); set_step_status(6,"⏳", 0.1)
             video_path = wavespeed_text_to_video(topic, BACKGROUND_VIDEO_RAW_PATH)
@@ -822,39 +891,27 @@ def run_pipeline():
             set_step_status(6,"☑️", 1.0)
 
         # Step 8: Final Video Creation
+        if stop_event.is_set(): return
         log("🎶 Merging video and audio..."); set_step_status(7,"⏳", 0.1)
-        
-        # FIX: Normalize path and replace backslashes with forward slashes for FFmpeg
         captions_file_path_ffmpeg = os.path.normpath(CAPTIONS_FILE_PATH).replace(os.path.sep, '/')
-        
-        ffmpeg_cmd = [
-            "ffmpeg", "-y",
-            "-stream_loop", "-1",
-            "-i", video_path,
-            "-i", audio_path,
-            "-map", "0:v:0", # Map video stream from first input
-            "-map", "1:a:0", # Map audio stream from second input
-            "-t", f"{audio_len:.3f}",
-            "-c:v", "libx264",
-            "-pix_fmt", "yuv420p"
-        ]
-        
-        # Add caption filter if enabled and captions file exists
+        ffmpeg_cmd = ["ffmpeg", "-y", "-stream_loop", "-1", "-i", video_path, "-i", audio_path, "-map", "0:v:0", "-map", "1:a:0", "-t", f"{audio_len:.3f}", "-c:v", "libx264", "-pix_fmt", "yuv420p"]
         if caption_var.get() and os.path.exists(CAPTIONS_FILE_PATH):
-             # Use the ASS filter for advanced styling
              ffmpeg_cmd += ["-vf", f"ass={captions_file_path_ffmpeg}"]
-        
         ffmpeg_cmd += [FINAL_VIDEO_PATH]
-
         subprocess.run(ffmpeg_cmd, check=True)
         set_step_status(7,"✅", 1.0); log(f"✅ Final video saved as {FINAL_VIDEO_PATH}")
 
-        messagebox.showinfo("Done",f"Video saved: {FINAL_VIDEO_PATH}")
+        if not stop_event.is_set():
+            messagebox.showinfo("Done",f"Video saved: {FINAL_VIDEO_PATH}")
 
     except Exception as e:
-        log(f"❌ Error: {e}"); messagebox.showerror("Error",str(e))
+        if not stop_event.is_set():
+            log(f"❌ Error: {e}"); messagebox.showerror("Error",str(e))
     finally:
+        if stop_event.is_set():
+            log("⏹️ Pipeline stopped by user.")
         run_button.configure(state="normal")
+        stop_button.configure(state="disabled")
         update_history_tab()
 
 # ============================
@@ -874,7 +931,7 @@ def save_keys():
         "SUBSCRIBE_MESSAGE": sub_message_entry.get().strip(),
         "SUBSCRIBE_RANDOM": subscribe_random_var.get(),
         "PODCAST_STYLE": style_combo.get(),
-        "VIDEO_PROMPT_STYLE": video_style_textbox.get("1.0", "end-1c").strip(), # Change this line
+        "VIDEO_PROMPT_STYLE": video_style_textbox.get("1.0", "end-1c").strip(),
         "FACT_CHECK_ENABLED": fact_check_var.get(),
         "CAPTION_ENABLED": caption_var.get(),
         "GENERATE_METADATA": metadata_var.get(),
@@ -883,9 +940,9 @@ def save_keys():
         "FACEBOOK_ACCESS_TOKEN": facebook_token_entry.get().strip(),
         "VIDEO_TITLE": video_title_entry.get().strip(),
         "VIDEO_DESCRIPTION": video_desc_entry.get("1.0", "end").strip(),
-        "VIDEO_TAGS": video_tags_entry.get().strip()
-        
-
+        "VIDEO_TAGS": video_tags_entry.get().strip(),
+        "HUMANOID_ENABLED": humanoid_enabled_var.get(),
+        "HUMANOID_PROBABILITY": float(humanoid_prob_entry.get().strip())
     })
 
     try:
@@ -899,6 +956,20 @@ def save_keys():
     genai_client = None
 
     messagebox.showinfo("Saved", "✅ Settings saved successfully")
+
+def stop_pipeline():
+    """Sets the stop event to gracefully halt the pipeline."""
+    log("🛑 Stop signal received. Finishing current step...")
+    stop_event.set()
+
+def start_pipeline_thread():
+    """Configures buttons and starts the pipeline in a new thread."""
+    stop_event.clear()  # Reset the stop event before starting
+    run_button.configure(state="disabled")
+    stop_button.configure(state="normal")
+    pipeline_thread = threading.Thread(target=run_pipeline, daemon=True)
+    pipeline_thread.start()
+
 def load_settings():
     # reload config.json from disk
     cfg = load_config()
@@ -931,6 +1002,9 @@ def load_settings():
     video_title_entry.delete(0, ctk.END); video_title_entry.insert(0, cfg.get("VIDEO_TITLE", ""))
     video_desc_entry.delete("1.0", ctk.END); video_desc_entry.insert("1.0", cfg.get("VIDEO_DESCRIPTION", ""))
     video_tags_entry.delete(0, ctk.END); video_tags_entry.insert(0, cfg.get("VIDEO_TAGS", ""))
+
+    humanoid_enabled_var.set(cfg.get("HUMANOID_ENABLED", False))
+    humanoid_prob_entry.delete(0, ctk.END); humanoid_prob_entry.insert(0, str(cfg.get("HUMANOID_PROBABILITY", 0.1)))
 
     youtube_id_entry.delete(0, ctk.END); youtube_id_entry.insert(0, cfg.get("YOUTUBE_CLIENT_ID", ""))
     youtube_secret_entry.delete(0, ctk.END); youtube_secret_entry.insert(0, cfg.get("YOUTUBE_CLIENT_SECRET", ""))
@@ -965,6 +1039,7 @@ main=tabs.add("Main")
 main.columnconfigure(0, weight=1)
 main.columnconfigure(1, weight=1)
 
+
 # Left side settings panel
 settings_frame = ctk.CTkFrame(main, corner_radius=10)
 settings_frame.grid(row=0, column=0, padx=10, pady=10, sticky="nsew")
@@ -987,6 +1062,10 @@ metadata_var = ctk.BooleanVar(value=config.get("GENERATE_METADATA", False))
 ctk.CTkCheckBox(settings_frame, text="Generate SEO Metadata", variable=metadata_var).pack(pady=5)
 
 run_button = ctk.CTkButton(settings_frame,text="🚀 Run Pipeline",command=lambda: threading.Thread(target=run_pipeline,daemon=True).start(), font=("Arial", 16, "bold"), fg_color="#1f6aa5"); run_button.pack(pady=20)
+
+stop_button = ctk.CTkButton(settings_frame, text="⏹️ Stop Pipeline", command=stop_pipeline, font=("Arial", 16, "bold"), fg_color="#c42034", hover_color="#851622", state="disabled")
+stop_button.pack(pady=(5, 20))
+
 
 # Right side log console
 log_frame = ctk.CTkFrame(main, corner_radius=10)
@@ -1036,6 +1115,17 @@ video_style_textbox = ctk.CTkTextbox(voices, width=580, height=80)
 video_style_textbox.grid(row=7, column=1, columnspan=3, sticky="w")
 ctk.CTkLabel(voices, text="Use {topic} as a placeholder for the video's topic.", font=("Arial", 10)).grid(row=8, column=1, sticky="w", padx=0, pady=(0, 8))
 # --- END OF REPLACEMENT ---
+
+# --- Humanoid Filter Section ---
+ctk.CTkLabel(voices, text="Humanoid Filter", font=("Arial", 16, "bold")).grid(row=9, column=0, columnspan=2, sticky="w", padx=5, pady=(20, 5))
+
+humanoid_enabled_var = ctk.BooleanVar(value=config.get("HUMANOID_ENABLED", False))
+ctk.CTkCheckBox(voices, text="Enable Humanoid Filter", variable=humanoid_enabled_var).grid(row=10, column=0, columnspan=2, pady=5, sticky="w", padx=10)
+
+ctk.CTkLabel(voices, text="Filler Probability (0.0 - 1.0)").grid(row=11, column=0, sticky="w", padx=5, pady=5)
+humanoid_prob_entry = ctk.CTkEntry(voices, width=100)
+humanoid_prob_entry.insert(0, str(config.get("HUMANOID_PROBABILITY", 0.1)))
+humanoid_prob_entry.grid(row=11, column=1, sticky="w", padx=5, pady=5)
 
 # --- BRANDING & SUBSCRIBE ---
 brand=tabs.add("Branding & Subscribe")
