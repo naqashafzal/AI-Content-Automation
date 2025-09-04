@@ -1,8 +1,9 @@
 customtkinter
-google-generativeai
 requests
+google-generativeai
 openai-whisper
-srt
 pysubs2
 numpy
-google-api-core
+google-auth-oauthlib
+google-api-python-client
+ffmpeg (installed system-wide)
