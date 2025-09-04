@@ -770,7 +770,7 @@ def run_pipeline():
         if start_point == "Podcast Script" or not os.path.exists(SCRIPT_FILE_PATH):
             log("📝 Generating script..."); set_step_status(2,"⏳", 0.1)
             host_p = config.get("HOST_PERSONA"); guest_p = config.get("GUEST_PERSONA")
-            script = gemini_podcast_script(topic, research, host_p, guest_p)
+            script = gemini_podcast_script(topic, research, host_p, guest_p, language="English")
             open(SCRIPT_FILE_PATH, "w", encoding="utf-8").write(script)
             set_step_status(2,"✅", 1.0); log("✅ Script saved")
         else:
