@@ -550,7 +550,21 @@ def gemini_fact_check(script:str)->str:
     ensure_genai()
     prompt = f"Review the following podcast script for factual accuracy. Identify any claims that are likely incorrect or require more nuance. Respond with a list of potential issues and suggestions for correction. If the script is generally accurate, state that. \n\nScript:\n{script}"
     response = genai_client.generate_content(prompt, safety_settings={'HARM_CATEGORY_DANGEROUS_CONTENT': 'BLOCK_NONE'})
-    return response.text
+    
+    try:
+        # This will now only be attempted if the response is valid
+        return response.text
+    except ValueError:
+        # This block will catch the error when response.text is invalid
+        logging.warning(f"Fact-check response was blocked or incomplete. Finish Reason: {response.candidates[0].finish_reason}")
+        if response.candidates[0].finish_reason.name == "MAX_TOKENS":
+            return "Fact-check could not be completed. The script is too long, causing the response to exceed the API's maximum token limit."
+        elif response.candidates[0].finish_reason.name == "SAFETY":
+            return f"Fact-check failed. The script or the model's response was blocked for safety reasons. Feedback: {response.prompt_feedback}"
+        else:
+            return f"Fact-check failed due to an unexpected API issue. Finish Reason: {response.candidates[0].finish_reason.name}"
+
+
 @handle_gemini_errors
 def gemini_tts_generate(script: str, output_path: str, mode: str = "Multi-Speaker", single_voice: str = "Kore") -> str:
     key = config.get("GEMINI_API_KEY", "").strip()
