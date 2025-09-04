@@ -99,7 +99,7 @@ Includes a polished GUI (built with `customtkinter`) for one-click pipelines, vo
   customtkinter
   requests
   google-generativeai
-  whisper
+  openai-whisper
   pysubs2
   numpy
   google-auth-oauthlib
