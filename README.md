@@ -40,7 +40,8 @@ Includes a polished GUI (built with `customtkinter`) for one-click pipelines, vo
 ---
 
 ## ✨ Features
-
+- **Multilanguage**
+  - "English", "Spanish", "French", "German", "Italian", "Portuguese","Urdu","Hindi","Dutch".
 - **Deep Research**  
   - Uses Gemini (with Google Search) to fetch current, in-depth context for topics and saves it as `summary.txt`.
 
