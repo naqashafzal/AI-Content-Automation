@@ -11,6 +11,9 @@ Includes a polished GUI (built with `customtkinter`) for one-click pipelines, vo
 
 ---
 
+## 🔋 How to Use Tutorial:
+-<a href="https://youtu.be/ZxYHexaSDwA?si=fhfWIJeohZ23fI12" > Full Video Tutorial </a>
+
 ## 🚀 Highlights
 
 - ✅ End-to-end pipeline: Research → Script → TTS → Captions → Video → Final Merge  
