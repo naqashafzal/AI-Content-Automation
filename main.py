@@ -17,6 +17,12 @@ import numpy as np
 import random
 from functools import wraps
 from google.api_core import exceptions as google_exceptions
+import pickle
+from pathlib import Path
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+from google.auth.transport.requests import Request
 
 # ============================
 # FORCE UTF-8
@@ -141,7 +147,7 @@ VOICE_OPTIONS = {
 }
 PODCAST_STYLES = ["Informative News","Comedy / Entertaining","Educational / Explainer","Motivational / Inspiring","Casual Conversational","Serious Debate"]
 VIDEO_PROMPT_STYLES = ["Cinematic Animation", "Documentary Style", "Abstract Visuals", "Futuristic Tech", "Vintage Film Look", "Simple Whiteboard"]
-steps=["Deep Research", "Generate SEO Metadata", "Podcast Script","Fact Check","Audio (TTS)","Caption Generation", "Video Generation", "Final Video Creation"]
+steps=["Deep Research", "Generate SEO Metadata", "Podcast Script","Fact Check", "Revise Script", "Audio (TTS)","Caption Generation", "Video Generation", "Final Video Creation"]
 step_rows=[]
 progress_bars=[]
 
@@ -429,6 +435,9 @@ def handle_gemini_errors(func):
             raise
     return wrapper
 
+
+
+
 @handle_gemini_errors
 def gemini_deep_research(topic:str)->str:
     """Performs deep research using Gemini with live Google Search."""
@@ -438,11 +447,20 @@ def gemini_deep_research(topic:str)->str:
     log("🌐 Using Google Search to find fresh, up-to-date information...")
 
     api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_TEXT_MODEL}:generateContent?key={key}"
+    
+    language_instruction = ""
+    if config.get("LANGUAGE_ENABLED", False):
+        language = config.get("PODCAST_LANGUAGE", "English")
+        if language.lower() == 'urdu':
+            language_instruction = "The summary must be written in Roman Urdu."
+        else:
+            language_instruction = f"The summary must be written in {language}."
+
     payload={
         "contents":[{"role":"user","parts":[{"text":(
             f"Use Google Search to find current, fresh, and in-depth information on the topic '{topic}'. "
             "Summarize the background, why it is trending, key facts, controversies, and outlook. "
-            "Provide a well-structured summary based on your search results."
+            f"Provide a well-structured summary based on your search results. {language_instruction}"
         )}]}],
         "tools": [{"google_search": {}}]
     }
@@ -496,7 +514,7 @@ def generate_seo_metadata(topic: str, research: str):
         return {"title": topic, "description": "", "tags": ""}
 
 @handle_gemini_errors
-def gemini_podcast_script(topic:str, research:str, host_persona:str, guest_persona:str, language:str)->str:
+def gemini_podcast_script(topic:str, research:str, host_persona:str, guest_persona:str)->str:
     ensure_genai()
     host, guest = config.get("HOST_NAME","Alex"), config.get("GUEST_NAME","Maya")
     channel=config.get("CHANNEL_NAME","My AI Channel")
@@ -505,6 +523,14 @@ def gemini_podcast_script(topic:str, research:str, host_persona:str, guest_perso
     randomize=config.get("SUBSCRIBE_RANDOM",True)
     style=config.get("PODCAST_STYLE","Informative News")
 
+    language_prompt = ""
+    language_instruction = "The entire script, including all dialogue and special instructions, must be in the specified language if provided."
+    if config.get("LANGUAGE_ENABLED", False):
+        language = config.get("PODCAST_LANGUAGE", "English")
+        language_prompt = f"In {language}, "
+        if language.lower() == 'urdu':
+            language_instruction = "The entire script, including all dialogue and special instructions, must be in Roman Urdu."
+
     placement_instruction = (
         f"- Insert about {sub_count} reminders randomly and naturally at different points."
         if randomize else
@@ -512,7 +538,7 @@ def gemini_podcast_script(topic:str, research:str, host_persona:str, guest_perso
     )
 
     prompt = f"""
-In {language}, turn this research into a podcast script.
+{language_prompt}turn this research into a podcast script.
 Podcast Title: {channel} - A Podcast about {topic}
 Hosts: {host} (Persona: {host_persona}) and {guest} (Persona: {guest_persona})
 Podcast Style: {style}
@@ -529,7 +555,7 @@ Special instructions:
 - Reminder text: "{sub_message}"
 - End with: "{host}: Thanks for listening! {sub_message}"
 - Use a conversational and engaging tone.
-- The entire script, including all dialogue and special instructions, must be in {language}.
+- {language_instruction}
 
 Topic: {topic}
 Research:
@@ -545,11 +571,26 @@ Research:
         script_content = add_fillers_to_script(script_content, humanoid_prob)
 
     return script_content
-
 @handle_gemini_errors
 def gemini_fact_check(script:str)->str:
     ensure_genai()
-    prompt = f"Review the following podcast script for factual accuracy. Identify any claims that are likely incorrect or require more nuance. Respond with a list of potential issues and suggestions for correction. If the script is generally accurate, state that. \n\nScript:\n{script}"
+
+    language_instruction = "Your entire response must be in English."
+    if config.get("LANGUAGE_ENABLED", False):
+        language = config.get("PODCAST_LANGUAGE", "English")
+        if language.lower() == 'urdu':
+            language_instruction = "Your entire response must be in Roman Urdu."
+        else:
+            language_instruction = f"Your entire response must be in {language}."
+
+    prompt = f"""
+Review the following podcast script for factual accuracy. Identify any claims that are likely incorrect or require more nuance.
+Respond with a list of potential issues and suggestions for correction. If the script is generally accurate, state that.
+{language_instruction}
+
+Script:
+{script}
+"""
     response = genai_client.generate_content(prompt, safety_settings={'HARM_CATEGORY_DANGEROUS_CONTENT': 'BLOCK_NONE'})
     
     try:
@@ -565,6 +606,21 @@ def gemini_fact_check(script:str)->str:
         else:
             return f"Fact-check failed due to an unexpected API issue. Finish Reason: {response.candidates[0].finish_reason.name}"
 
+@handle_gemini_errors
+def gemini_revise_script(script:str, fact_check_result:str)->str:
+    ensure_genai()
+    prompt = f"""
+    Based on the following fact-check results, please revise the podcast script to be more accurate.
+    Only output the revised script, with no extra commentary.
+
+    **Fact-Check Results:**
+    {fact_check_result}
+
+    **Original Script:**
+    {script}
+    """
+    response = genai_client.generate_content(prompt, safety_settings={'HARM_CATEGORY_DANGEROUS_CONTENT': 'BLOCK_NONE'})
+    return response.text
 
 @handle_gemini_errors
 def gemini_tts_generate(script: str, output_path: str, mode: str = "Multi-Speaker", single_voice: str = "Kore") -> str:
@@ -652,8 +708,6 @@ def gemini_tts_generate(script: str, output_path: str, mode: str = "Multi-Speake
 
     # If all retries failed
     raise RuntimeError("Gemini TTS failed after multiple retries.")
-
-
 def wavespeed_text_to_video(topic: str, video_path) -> str:
     wavespeed_key = config.get("WAVESPEED_AI_KEY", "").strip()
     if not wavespeed_key:
@@ -737,21 +791,174 @@ def wavespeed_text_to_video(topic: str, video_path) -> str:
     except Exception as e:
         logging.error(f"Video generation process failed: {e}", exc_info=True)
         raise RuntimeError(f"Video generation process failed: {e}")
+def youtube_auth():
+    """Handles YouTube API authentication."""
+    CLIENT_SECRETS_FILE = "client_secrets.json"
+    if not os.path.exists(CLIENT_SECRETS_FILE):
+        messagebox.showerror("Error", f"{CLIENT_SECRETS_FILE} not found. Please create one in the Google Cloud Console and place it in the same directory as this script.")
+        return None
+
+    credentials = None
+    pickle_file = Path("token.pickle")
+
+    if pickle_file.exists():
+        with open(pickle_file, "rb") as token:
+            credentials = pickle.load(token)
+
+    if not credentials or not credentials.valid:
+        if credentials and credentials.expired and credentials.refresh_token:
+            credentials.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(
+                CLIENT_SECRETS_FILE,
+                scopes=["https://www.googleapis.com/auth/youtube.upload"],
+                redirect_uri='http://localhost:8080/'
+            )
+            credentials = flow.run_local_server(port=8080)
+
+        with open(pickle_file, "wb") as f:
+            pickle.dump(credentials, f)
+    
+    return credentials
 
 def upload_youtube():
-    # Placeholder for YouTube upload logic
-    log("▶️ Authenticating and uploading to YouTube...")
-    # Add YouTube Data API authentication and upload logic here
-    # This typically involves OAuth 2.0 flow, which requires a new window to open
-    # You would need to store credentials and tokens in config.json
-    messagebox.showinfo("Upload", "YouTube upload functionality not yet implemented.")
+    """Authenticates and uploads a video to YouTube."""
+    try:
+        # Disable the button to prevent multiple uploads
+        youtube_upload_button.configure(state="disabled")
+
+      # Check if a custom video path is provided
+        custom_video_path = video_path_entry.get().strip()
+        if custom_video_path and os.path.exists(custom_video_path):
+            video_path = custom_video_path
+        else:
+            safe_topic = re.sub(r'[\\/:*?"<>|]', '', topic_entry.get().strip())
+            video_path = os.path.join(safe_topic, "final_podcast_video.mp4")
+
+        if not os.path.exists(video_path):
+            return messagebox.showerror("Error", "Final video not found. Please run the pipeline or select a valid video file.")
+
+
+        log("▶️ Authenticating with YouTube...")
+        credentials = youtube_auth()
+        if not credentials:
+            log("❌ YouTube authentication failed.")
+            youtube_upload_button.configure(state="normal")
+            return
+
+        youtube = build("youtube", "v3", credentials=credentials)
+        log("✅ YouTube authentication successful.")
+
+        request_body = {
+            "snippet": {
+                "title": video_title_entry.get(),
+                "description": video_desc_entry.get("1.0", ctk.END),
+                "tags": video_tags_entry.get().split(","),
+                "categoryId": "22" # People & Blogs category
+            },
+            "status": {
+                "privacyStatus": "public" # or 'private' or 'unlisted'
+            }
+        }
+        
+        log(f"📤 Uploading '{video_path}' to YouTube...")
+        media = MediaFileUpload(video_path, chunksize=-1, resumable=True)
+        request = youtube.videos().insert(
+            part=",".join(request_body.keys()),
+            body=request_body,
+            media_body=media
+        )
+
+        response = None
+        while response is None:
+            status, response = request.next_chunk()
+            if status:
+                log(f"⬆️ Uploaded {int(status.progress() * 100)}%")
+
+        log(f"✅ Video uploaded successfully! Video ID: {response.get('id')}")
+        messagebox.showinfo("Upload Complete", f"Successfully uploaded to YouTube! Video ID: {response.get('id')}")
+
+    except Exception as e:
+        log(f"❌ YouTube upload failed: {e}")
+        messagebox.showerror("Upload Error", f"An error occurred during YouTube upload: {e}")
+    finally:
+        # Re-enable the button
+        youtube_upload_button.configure(state="normal")
 
 def upload_facebook():
-    # Placeholder for Facebook upload logic
-    log("▶️ Authenticating and uploading to Facebook...")
-    # Add Facebook Graph API authentication and upload logic here
-    # This also involves a complex OAuth 2.0 flow
-    messagebox.showinfo("Upload", "Facebook upload functionality not yet implemented.")
+    """Authenticates and uploads a video to Facebook."""
+    try:
+        # Disable the button to prevent multiple uploads
+        facebook_upload_button.configure(state="disabled")
+
+         # Check if a custom video path is provided
+        custom_video_path = video_path_entry.get().strip()
+        if custom_video_path and os.path.exists(custom_video_path):
+            video_path = custom_video_path
+        else:
+            safe_topic = re.sub(r'[\\/:*?"<>|]', '', topic_entry.get().strip())
+            video_path = os.path.join(safe_topic, "final_podcast_video.mp4")
+
+        if not os.path.exists(video_path):
+            return messagebox.showerror("Error", "Final video not found. Please run the pipeline or select a valid video file.")
+        
+        log("▶️ Uploading to Facebook...")
+
+        # Step 1: Initialize the upload session
+        init_url = f"https://graph-video.facebook.com/v20.0/me/videos"
+        init_params = {
+            "access_token": access_token,
+            "upload_phase": "start"
+        }
+        init_response = requests.post(init_url, params=init_params).json()
+        
+        if "error" in init_response:
+            raise RuntimeError(f"Facebook API Error: {init_response['error']['message']}")
+
+        upload_session_id = init_response["upload_session_id"]
+        video_id = init_response["video_id"]
+        
+        log(f"✅ Facebook upload session started. Session ID: {upload_session_id}")
+
+        # Step 2: Upload the video file
+        upload_url = f"https://graph-video.facebook.com/v20.0/{upload_session_id}"
+        with open(video_path, 'rb') as video_file:
+            video_data = video_file.read()
+
+        upload_headers = {
+            "Authorization": f"OAuth {access_token}",
+            "file_offset": "0"
+        }
+        upload_response = requests.post(upload_url, headers=upload_headers, data=video_data)
+        
+        if "error" in upload_response.json():
+            raise RuntimeError(f"Facebook API Error during upload: {upload_response.json()['error']['message']}")
+        
+        log("✅ Video file uploaded to Facebook.")
+
+        # Step 3: Finish the upload session and publish
+        finish_url = f"https://graph-video.facebook.com/v20.0/me/videos"
+        finish_params = {
+            "access_token": access_token,
+            "upload_phase": "finish",
+            "upload_session_id": upload_session_id,
+            "title": video_title_entry.get(),
+            "description": video_desc_entry.get("1.0", ctk.END)
+        }
+        finish_response = requests.post(finish_url, params=finish_params).json()
+
+        if "error" in finish_response:
+            raise RuntimeError(f"Facebook API Error on finishing: {finish_response['error']['message']}")
+
+        log(f"✅ Video published successfully to Facebook! Video ID: {video_id}")
+        messagebox.showinfo("Upload Complete", f"Successfully published to Facebook! Video ID: {video_id}")
+
+    except Exception as e:
+        log(f"❌ Facebook upload failed: {e}")
+        messagebox.showerror("Upload Error", f"An error occurred during Facebook upload: {e}")
+    finally:
+        # Re-enable the button
+        facebook_upload_button.configure(state="normal")
 
 def get_history_items():
     history_items = []
@@ -786,7 +993,51 @@ def update_history_tab():
             ctk.CTkLabel(row, text=item, anchor="w", font=("Arial", 12, "bold")).pack(side="left", padx=10, pady=5)
             delete_btn = ctk.CTkButton(row, text="Delete", command=lambda i=item: delete_history_item(i), fg_color="#FF0000", hover_color="#8c0303", text_color="white")
             delete_btn.pack(side="right", padx=10, pady=5)
+# ============================
+# Publish Metadata
+# ============================
+def generate_seo_only():
+    """Generates only the SEO metadata and fills the fields."""
+    topic = topic_entry.get().strip()
+    if not topic:
+        return messagebox.showerror("Error", "Please enter a topic first.")
 
+    safe_topic = re.sub(r'[\\/:*?"<>|]', '', topic)
+    summary_file_path = os.path.join(safe_topic, "summary.txt")
+
+    research = ""
+    try:
+        if os.path.exists(summary_file_path):
+            log("➡️ Using existing research for SEO generation.")
+            with open(summary_file_path, "r", encoding="utf-8") as f:
+                research = f.read()
+        else:
+            log("🔍 Research not found. Running deep research first...")
+            research = gemini_deep_research(topic)
+            if not os.path.exists(safe_topic):
+                os.makedirs(safe_topic)
+            with open(summary_file_path, "w", encoding="utf-8") as f:
+                f.write(research)
+            log("✅ Research complete.")
+
+        log("📄 Generating SEO metadata...")
+        metadata = generate_seo_metadata(topic, research)
+        
+        video_title_entry.delete(0, ctk.END)
+        video_title_entry.insert(0, metadata.get("title", topic))
+        
+        video_desc_entry.delete("1.0", ctk.END)
+        video_desc_entry.insert("1.0", metadata.get("description", ""))
+
+        video_tags_entry.delete(0, ctk.END)
+        video_tags_entry.insert(0, metadata.get("tags", ""))
+        
+        log("✅ SEO metadata generated and pre-filled.")
+        messagebox.showinfo("Success", "SEO Title and Description have been generated!")
+
+    except Exception as e:
+        log(f"❌ Error during SEO generation: {e}")
+        messagebox.showerror("Error", f"Failed to generate SEO metadata: {e}")
 
 # ============================
 # PIPELINE
@@ -850,7 +1101,7 @@ def run_pipeline():
         if start_point == "Podcast Script" or not os.path.exists(SCRIPT_FILE_PATH):
             log("📝 Generating script..."); set_step_status(2,"⏳", 0.1)
             host_p = config.get("HOST_PERSONA"); guest_p = config.get("GUEST_PERSONA")
-            script = gemini_podcast_script(topic, research, host_p, guest_p, language="English")
+            script = gemini_podcast_script(topic, research, host_p, guest_p)
             open(SCRIPT_FILE_PATH, "w", encoding="utf-8").write(script)
             set_step_status(2,"✅", 1.0); log("✅ Script saved")
         else:
@@ -865,8 +1116,17 @@ def run_pipeline():
             fact_check_result = gemini_fact_check(script)
             log("--- Fact Check Results ---"); log(fact_check_result)
             set_step_status(3,"✅", 1.0); log("✅ Fact check complete")
+
+            # Step 5: Revise Script
+            if stop_event.is_set(): return
+            log("✍️ Revising script based on fact-check..."); set_step_status(4,"⏳", 0.1)
+            script = gemini_revise_script(script, fact_check_result)
+            open(SCRIPT_FILE_PATH, "w", encoding="utf-8").write(script) # Overwrite script with revised version
+            set_step_status(4,"✅", 1.0); log("✅ Script revised and saved")
         else:
             set_step_status(3, "⏭️", 1.0)
+            set_step_status(4, "⏭️", 1.0) # Skip revise step as well
+
 
         # Step 5: TTS
         if stop_event.is_set(): return
@@ -957,7 +1217,10 @@ def save_keys():
         "VIDEO_DESCRIPTION": video_desc_entry.get("1.0", "end").strip(),
         "VIDEO_TAGS": video_tags_entry.get().strip(),
         "HUMANOID_ENABLED": humanoid_enabled_var.get(),
+        "LANGUAGE_ENABLED": language_enabled_var.get(),
+        "PODCAST_LANGUAGE": language_combo.get(),
         "HUMANOID_PROBABILITY": float(humanoid_prob_entry.get().strip())
+        
     })
 
     try:
@@ -1024,10 +1287,17 @@ def load_settings():
     youtube_id_entry.delete(0, ctk.END); youtube_id_entry.insert(0, cfg.get("YOUTUBE_CLIENT_ID", ""))
     youtube_secret_entry.delete(0, ctk.END); youtube_secret_entry.insert(0, cfg.get("YOUTUBE_CLIENT_SECRET", ""))
     facebook_token_entry.delete(0, ctk.END); facebook_token_entry.insert(0, cfg.get("FACEBOOK_ACCESS_TOKEN", ""))
+    language_enabled_var.set(cfg.get("LANGUAGE_ENABLED", False))
+    language_combo.set(cfg.get("PODCAST_LANGUAGE", "English"))
 
 
 def browse_file(entry):
-    filename = filedialog.askopenfilename(filetypes=[("Image files", "*.png;*.jpg;*.jpeg"), ("Audio files", "*.mp3;*.wav")])
+    filename = filedialog.askopenfilename(filetypes=[
+        ("Video files", "*.mp4;*.mkv;*.avi"),
+        ("Image files", "*.png;*.jpg;*.jpeg"), 
+        ("Audio files", "*.mp3;*.wav"),
+        ("All files", "*.*")
+    ])
     if filename:
         entry.delete(0, ctk.END)
         entry.insert(0, filename)
@@ -1036,7 +1306,7 @@ def open_url(url):
     webbrowser.open_new(url)
 
 ctk.set_appearance_mode("dark"); ctk.set_default_color_theme("blue")
-app=ctk.CTk(); app.title("🎙️ Nullpk YT Automation"); app.geometry("1100x1250")
+app=ctk.CTk(); app.title("🎙️ Nullpk Content Automation"); app.geometry("1100x1250")
 
 tabs=ctk.CTkTabview(app,width=1080,height=1150); tabs.pack(padx=10,pady=10,fill="both",expand=True)
 
@@ -1044,7 +1314,7 @@ tabs=ctk.CTkTabview(app,width=1080,height=1150); tabs.pack(padx=10,pady=10,fill=
 header_frame = ctk.CTkFrame(app, corner_radius=10, fg_color="transparent")
 header_frame.pack(side="top", fill="x", padx=10, pady=(5, 0))
 
-header_label = ctk.CTkLabel(header_frame, text="Nullpk YT Automation", font=("Arial", 24, "bold"), text_color="#1f6aa5")
+header_label = ctk.CTkLabel(header_frame, text="Nullpk Content Automation", font=("Arial", 24, "bold"), text_color="#1f6aa5")
 header_label.pack(side="left", padx=10, pady=5)
 author_label = ctk.CTkLabel(header_frame, text="Author: Naqash Afzal", font=("Arial", 14), text_color="#aaaaaa")
 author_label.pack(side="right", padx=10, pady=5)
@@ -1142,6 +1412,17 @@ humanoid_prob_entry = ctk.CTkEntry(voices, width=100)
 humanoid_prob_entry.insert(0, str(config.get("HUMANOID_PROBABILITY", 0.1)))
 humanoid_prob_entry.grid(row=11, column=1, sticky="w", padx=5, pady=5)
 
+# --- Language Selection Section ---
+ctk.CTkLabel(voices, text="Language Settings", font=("Arial", 16, "bold")).grid(row=12, column=0, columnspan=2, sticky="w", padx=5, pady=(20, 5))
+
+language_enabled_var = ctk.BooleanVar(value=config.get("LANGUAGE_ENABLED", False))
+ctk.CTkCheckBox(voices, text="Enable Language Selection", variable=language_enabled_var).grid(row=13, column=0, columnspan=2, pady=5, sticky="w", padx=10)
+
+ctk.CTkLabel(voices, text="Podcast Language").grid(row=14, column=0, sticky="w", padx=5, pady=5)
+language_combo = ctk.CTkComboBox(voices, values=["English", "Spanish", "French", "German", "Italian", "Portuguese","Urdu","Hindi","Dutch"], width=300)
+language_combo.set(config.get("PODCAST_LANGUAGE", "English"))
+language_combo.grid(row=14, column=1, sticky="w", padx=5, pady=5)
+
 # --- BRANDING & SUBSCRIBE ---
 brand=tabs.add("Branding & Subscribe")
 ctk.CTkLabel(brand,text="Channel Name").grid(row=0,column=0,sticky="w",padx=5,pady=8)
@@ -1168,36 +1449,60 @@ ctk.CTkButton(brand,text="💾 Save Settings",command=save_keys).grid(row=6,colu
 
 # --- PUBLISH TAB ---
 publish=tabs.add("Publish")
-publish.columnconfigure((0,1,2,3), weight=1, uniform="a")
-ctk.CTkLabel(publish, text="Video Metadata", font=("Arial", 16, "bold")).grid(row=0, column=0, columnspan=4, pady=(10,5))
+publish.columnconfigure((0, 1, 2, 3), weight=1, uniform="a")
+
+# --- Video Metadata Section ---
+metadata_frame = ctk.CTkFrame(publish, fg_color="transparent")
+metadata_frame.grid(row=0, column=0, columnspan=4, sticky="ew", padx=10, pady=(10,5))
+ctk.CTkLabel(metadata_frame, text="Video Metadata", font=("Arial", 16, "bold")).pack(side="left")
+ctk.CTkButton(metadata_frame, text="✨ Generate SEO", command=generate_seo_only).pack(side="left", padx=10)
 
 ctk.CTkLabel(publish, text="Video Title:").grid(row=1, column=0, sticky="w", padx=10, pady=5)
-video_title_entry = ctk.CTkEntry(publish, width=400, placeholder_text="Enter video title"); video_title_entry.grid(row=1, column=1, columnspan=3, sticky="w", padx=10, pady=5)
-ctk.CTkLabel(publish, text="Description:").grid(row=2, column=0, sticky="w", padx=10, pady=5)
-video_desc_entry = ctk.CTkTextbox(publish, width=400, height=120); video_desc_entry.grid(row=2, column=1, columnspan=3, sticky="w", padx=10, pady=5)
+video_title_entry = ctk.CTkEntry(publish, width=400, placeholder_text="Enter video title")
+video_title_entry.grid(row=1, column=1, columnspan=3, sticky="ew", padx=10, pady=5)
+
+ctk.CTkLabel(publish, text="Description:").grid(row=2, column=0, sticky="nw", padx=10, pady=5)
+video_desc_entry = ctk.CTkTextbox(publish, width=400, height=120)
+video_desc_entry.grid(row=2, column=1, columnspan=3, sticky="ew", padx=10, pady=5)
+
 ctk.CTkLabel(publish, text="Tags (comma-separated):").grid(row=3, column=0, sticky="w", padx=10, pady=5)
-video_tags_entry = ctk.CTkEntry(publish, width=400, placeholder_text="tag1, tag2, tag3"); video_tags_entry.grid(row=3, column=1, columnspan=3, sticky="w", padx=10, pady=5)
+video_tags_entry = ctk.CTkEntry(publish, width=400, placeholder_text="tag1, tag2, tag3")
+video_tags_entry.grid(row=3, column=1, columnspan=3, sticky="ew", padx=10, pady=5)
 
+# --- Upload Section ---
 ctk.CTkLabel(publish, text="--- Upload to Social Media ---", font=("Arial", 16, "bold")).grid(row=4, column=0, columnspan=4, pady=(20,5))
-youtube_upload_button = ctk.CTkButton(publish, text="Upload to YouTube", command=upload_youtube, fg_color="#FF0000", hover_color="#8c0303", text_color="white")
-youtube_upload_button.grid(row=5, column=0, columnspan=2, padx=10, pady=10)
-facebook_upload_button = ctk.CTkButton(publish, text="Upload to Facebook", command=upload_facebook, fg_color="#1877F2", hover_color="#1456b3", text_color="white")
-facebook_upload_button.grid(row=5, column=2, columnspan=2, padx=10, pady=10)
 
-ctk.CTkLabel(publish, text="--- API Credentials ---", font=("Arial", 16, "bold")).grid(row=6, column=0, columnspan=4, pady=(20,5))
-ctk.CTkLabel(publish, text="YouTube Client ID:").grid(row=7, column=0, sticky="w", padx=10, pady=5)
-youtube_id_entry = ctk.CTkEntry(publish, width=400, show="*", placeholder_text="Enter YouTube Client ID"); youtube_id_entry.grid(row=7, column=1, columnspan=3, sticky="w", padx=10, pady=5)
-ctk.CTkLabel(publish, text="YouTube Client Secret:").grid(row=8, column=0, sticky="w", padx=10, pady=5)
-youtube_secret_entry = ctk.CTkEntry(publish, width=400, show="*", placeholder_text="Enter YouTube Client Secret"); youtube_secret_entry.grid(row=8, column=1, columnspan=3, sticky="w", padx=10, pady=5)
-ctk.CTkLabel(publish, text="Facebook Access Token:").grid(row=9, column=0, sticky="w", padx=10, pady=5)
-facebook_token_entry = ctk.CTkEntry(publish, width=400, show="*", placeholder_text="User/Page access token"); facebook_token_entry.grid(row=9, column=1, columnspan=3, sticky="w", padx=10, pady=5)
+# Video File Selection
+ctk.CTkLabel(publish, text="Video File:").grid(row=5, column=0, sticky="w", padx=10, pady=5)
+video_path_entry = ctk.CTkEntry(publish, width=300, placeholder_text="Leave blank to use generated video")
+video_path_entry.grid(row=5, column=1, columnspan=2, sticky="ew", padx=10, pady=5)
+ctk.CTkButton(publish, text="Browse...", command=lambda: browse_file(video_path_entry)).grid(row=5, column=3, sticky="w", padx=10, pady=5)
+
+youtube_upload_button = ctk.CTkButton(publish, text="Upload to YouTube", command=upload_youtube, fg_color="#FF0000", hover_color="#8c0303", text_color="white")
+youtube_upload_button.grid(row=6, column=0, columnspan=2, padx=10, pady=10)
+facebook_upload_button = ctk.CTkButton(publish, text="Upload to Facebook", command=upload_facebook, fg_color="#1877F2", hover_color="#1456b3", text_color="white")
+facebook_upload_button.grid(row=6, column=2, columnspan=2, padx=10, pady=10)
+
+# --- API Credentials Section ---
+ctk.CTkLabel(publish, text="--- API Credentials ---", font=("Arial", 16, "bold")).grid(row=7, column=0, columnspan=4, pady=(20,5))
+ctk.CTkLabel(publish, text="YouTube Client ID:").grid(row=8, column=0, sticky="w", padx=10, pady=5)
+youtube_id_entry = ctk.CTkEntry(publish, width=400, show="*", placeholder_text="Enter YouTube Client ID")
+youtube_id_entry.grid(row=8, column=1, columnspan=3, sticky="ew", padx=10, pady=5)
+
+ctk.CTkLabel(publish, text="YouTube Client Secret:").grid(row=9, column=0, sticky="w", padx=10, pady=5)
+youtube_secret_entry = ctk.CTkEntry(publish, width=400, show="*", placeholder_text="Enter YouTube Client Secret")
+youtube_secret_entry.grid(row=9, column=1, columnspan=3, sticky="ew", padx=10, pady=5)
+
+ctk.CTkLabel(publish, text="Facebook Access Token:").grid(row=10, column=0, sticky="w", padx=10, pady=5)
+facebook_token_entry = ctk.CTkEntry(publish, width=400, show="*", placeholder_text="User/Page access token")
+facebook_token_entry.grid(row=10, column=1, columnspan=3, sticky="ew", padx=10, pady=5)
 
 # --- HISTORY TAB ---
 history_tab_frame = tabs.add("History")
 
 # --- ABOUT FRAME ---
 about=tabs.add("About")
-ctk.CTkLabel(about, text="Nullpk YT Automation", font=("Arial", 20, "bold")).pack(pady=(20, 5))
+ctk.CTkLabel(about, text="Nullpk Content Automation", font=("Arial", 20, "bold")).pack(pady=(20, 5))
 ctk.CTkLabel(about, text="Version 1.0", font=("Arial", 12)).pack(pady=0)
 ctk.CTkLabel(about, text="Author: Naqash Afzal", font=("Arial", 12)).pack(pady=5)
 ctk.CTkLabel(about, text="""
