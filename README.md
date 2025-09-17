@@ -4,7 +4,7 @@
   </a>
 </p>
 
-# 🎙️ Nullpk Content Automation
+# 🎙️ Nullpk AI Content Studio
 
 An **AI-powered content automation tool** that generates full podcast-style videos — from deep research to a ready-to-upload MP4 — using **Google Gemini**, **WaveSpeed AI**, **Whisper**, and **ffmpeg**.  
 Includes a polished GUI (built with `customtkinter`) for one-click pipelines, voice/persona configuration, captioning, and direct uploads to YouTube & Facebook.
