@@ -2,7 +2,9 @@
 api_clients.py
 
 This module centralizes all interactions with external APIs into dedicated classes.
-(Updated to use Imagen 2 for video generation instead of Veo 3).
+It handles the construction of API requests, sending them, and processing the
+responses, including robust error handling. This keeps the main pipeline logic
+clean and focused on orchestration rather than API specifics.
 """
 import requests
 import time
@@ -13,29 +15,28 @@ import logging
 from functools import wraps
 import re
 import google.generativeai as genai
-from google.generativeai.types import HarmCategory, HarmBlockThreshold
 from google.api_core import exceptions as google_exceptions
 
 # Safely import Google Cloud libraries for Vertex AI
 try:
     from google.cloud import aiplatform
     import vertexai
-    from vertexai.generative_models import GenerativeModel # Still needed for Gemini text models
-    # --- UPDATED IMPORT: Added VideoGenerationModel ---
-    from vertexai.preview.vision_models import ImageGenerationModel, VideoGenerationModel
+    from vertexai.generative_models import GenerativeModel
+    from vertexai.preview.vision_models import ImageGenerationModel
 except ImportError:
     logging.warning("Failed to import Google Cloud libraries. Vertex AI functionality will be disabled.")
     aiplatform = None
     vertexai = None
     ImageGenerationModel = None
-    VideoGenerationModel = None # <-- ADDED this
+
 
 # --- API Constants (As specified by user) ---
 GEMINI_TEXT_MODEL = "gemini-2.5-flash"
 GEMINI_TTS_MODEL = "gemini-2.5-flash-preview-tts"
 WAVESPEED_T2V_API_URL = "https://api.wavespeed.ai/api/v3/wavespeed-ai/wan-2.2/t2v-480p-ultra-fast"
 WAVESPEED_POLL_URL = "https://api.wavespeed.ai/api/v3/predictions/{}/result"
-# --- VEO_MODEL_ID constant removed, as we are now using the Imagen 2 model via VideoGenerationModel ---
+VEO_MODEL_ID = "veo-3.0-generate-preview" # For Vertex AI Video
+NANO_BANANA_IMAGE_MODEL = "gemini-2.5-flash-image-preview" # For Vertex AI Image
 
 
 def handle_api_errors(func):
@@ -92,15 +93,7 @@ class GoogleClient:
             raise ValueError("Google API key is missing.")
         self.api_key = api_key
         genai.configure(api_key=api_key)
-        
-        self.safety_settings = {
-            HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
-            HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
-            HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
-            HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
-        }
-        
-        self.text_model = genai.GenerativeModel(GEMINI_TEXT_MODEL, safety_settings=self.safety_settings)
+        self.text_model = genai.GenerativeModel(GEMINI_TEXT_MODEL)
         self.project_id = project_id
         self.location = location
 
@@ -124,12 +117,11 @@ class GoogleClient:
             "3. The primary points of controversy, debate, or public questions. "
             f"Format this analysis as a structured brief. {language_instruction}"
         )
-        
         api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_TEXT_MODEL}:generateContent?key={self.api_key}"
-        payload = {"contents": [{"parts": [{"text": facet_prompt}]}], "tools": [{"google_search": {}}]}
+        facet_payload = {"contents": [{"parts": [{"text": facet_prompt}]}], "tools": [{"google_search": {}}]}
         
         try:
-            response = requests.post(api_url, json=payload, timeout=120)
+            response = requests.post(api_url, json=facet_payload, timeout=120)
             response.raise_for_status()
             response_json = response.json()
             facet_analysis = response_json.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text")
@@ -142,34 +134,41 @@ class GoogleClient:
         synthesis_prompt = (
             f"You are a research analyst. Your goal is to create a single, comprehensive, and well-structured summary on the topic '{topic}'. "
             "You must synthesize the following two sources of information: "
+            
             f"\nSOURCE 1: A preliminary analysis of the topic's key facets:\n---START SOURCE 1---\n{facet_analysis}\n---END SOURCE 1---"
+            
             f"\nSOURCE 2: A feed of recent news headlines:\n---START SOURCE 2---\n{external_data}\n---END SOURCE 2---"
+            
             "\nYOUR TASK: "
             "Using ONLY the information provided in the sources above, write a detailed, synthesized summary. This summary must cover the topic's background, why it is trending, key facts, primary controversies/debates, and the future outlook. "
             "Ensure the summary is well-organized, factually dense, and coherent. "
             f"{language_instruction}"
         )
-        
-        response = self.text_model.generate_content(synthesis_prompt)
+
+        final_model = genai.GenerativeModel(GEMINI_TEXT_MODEL)
+        response = final_model.generate_content(synthesis_prompt)
         return response.text
 
     @handle_api_errors
-    def generate_seo_metadata(self, topic: str, context: str) -> dict:
-        logging.info("Generating expert SEO metadata from context...")
+    def generate_seo_metadata(self, topic: str, script: str) -> dict:
+        logging.info("Generating expert SEO metadata from final script...")
         prompt = f"""
         Act as a world-class YouTube SEO strategist. Your task is to generate a complete, optimized metadata package for a video based on its final script.
+
         CRITICAL INSTRUCTIONS:
         1.  **Title:** Create a title that is keyword-rich at the beginning, creates intrigue, uses power words/numbers, and is under 70 characters.
-        2.  **Description:** Write a 3-paragraph description. The first sentence must be a captivating hook with the main keywords. The rest should summarize the key points discussed in the context provided.
+        2.  **Description:** Write a 3-paragraph description. The first sentence must be a captivating hook with the main keywords. The rest should summarize the key points discussed in the script.
         3.  **Tags:** Generate 10-15 comma-separated tags, mixing broad and specific (long-tail) keywords. The first tag must be the main keyword.
         4.  **Output Format:** Your response MUST be a single, valid JSON object and nothing else. Do not include intros, explanations, or code blocks.
             -   JSON must have keys: "title", "description", "tags".
             -   **DO NOT** include timestamps in this output.
+
         **VIDEO TOPIC:** {topic}
-        **CONTEXT (Full Script or Research Summary):**
+        **FULL SCRIPT (for context):**
         ```
-        {context}
+        {script}
         ```
+
         Generate the complete JSON metadata package now.
         """
         response = self.text_model.generate_content(prompt, generation_config={"response_mime_type": "application/json"})
@@ -182,7 +181,8 @@ class GoogleClient:
                 text = response.text
                 json_match = re.search(r'\{.*\}', text, re.DOTALL)
                 if json_match:
-                    return json.loads(json_match.group(0))
+                    json_str = json_match.group(0)
+                    return json.loads(json_str)
                 else:
                     raise ValueError("No JSON object found in the SEO response.")
             except (json.JSONDecodeError, ValueError) as e:
@@ -191,139 +191,138 @@ class GoogleClient:
 
     @handle_api_errors
     def generate_podcast_script(self, topic:str, research:str, config: dict)->str:
-        logging.info("Generating podcast script...")
+        logging.info("Generating podcast script with new 'natural conversation' model...")
+        host, guest = config.get("HOST_NAME","Alex"), config.get("GUEST_NAME","Maya")
+        host_persona = config.get("HOST_PERSONA", "A friendly podcast host.")
+        guest_persona = config.get("GUEST_PERSONA", "An expert on the topic.")
+        channel = config.get("CHANNEL_NAME","My AI Channel")
+        sub_count, sub_message = config.get("SUBSCRIBE_COUNT", 3), config.get("SUBSCRIBE_MESSAGE","...").replace("{channel}", channel)
+        randomize, style = config.get("SUBSCRIBE_RANDOM", True), config.get("PODCAST_STYLE", "Informative News")
+        script_length, story_arc = config.get("SCRIPT_LENGTH", "Medium (~5 minutes)"), config.get("STORY_ARC", "None")
         
-        content_style = config.get("CONTENT_STYLE", "Podcast")
-        is_podcast_mode = (content_style == "Podcast")
-        style = config.get("PODCAST_STYLE", "Informative News")
-        script_length = config.get("SCRIPT_LENGTH", "Medium (~5 minutes)")
-        story_arc = config.get("STORY_ARC", "None")
-
         style_instructions = {
-            "Informative News": "Adopt a balanced, journalistic tone. Focus on clarity, factual accuracy, and presenting key information concisely.",
-            "Comedy / Entertaining": "Inject humor, witty banter, and playful disagreements. Use exaggeration and amusing analogies.",
-            "Educational / Explainer": "Break down complex topics into simple, understandable segments. Use analogies and real-world examples.",
-            "Motivational / Inspiring": "Use powerful, uplifting language. Build towards an inspiring conclusion. Share personal anecdotes.",
-            "Casual Conversational": "Create a relaxed, 'friends chatting' vibe. The dialogue should be natural, with slang and overlapping thoughts.",
-            "Serious Debate": "Construct a structured argument with clear points and counterpoints. The tone should be formal and persuasive.",
-            "Story Mode": "Narrate a compelling story. Use descriptive language to build atmosphere and suspense.",
-            "Documentary": "Follow a formal, narrative structure. Act as a narrator guiding the listener with clarity and authority.",
-            "ASMR": "Focus on soft, gentle, and relaxing words. Emphasize crisp consonant sounds and create a calming atmosphere."
+            "Informative News": "Adopt a balanced, journalistic tone. Focus on clarity, factual accuracy, and presenting key information concisely. The dialogue should be professional and direct.",
+            "Comedy / Entertaining": "Inject humor, witty banter, and playful disagreements. Use exaggeration and amusing analogies. The hosts should have great chemistry and sound like they are having fun.",
+            "Educational / Explainer": "Break down complex topics into simple, understandable segments. Use analogies and real-world examples. The guest should act as a patient teacher, and the host should ask clarifying questions on behalf of the audience.",
+            "Motivational / Inspiring": "Use powerful, uplifting language. The dialogue should build towards an inspiring conclusion. Share personal anecdotes or success stories related to the topic.",
+            "Casual Conversational": "Create a relaxed, 'friends chatting over coffee' vibe. The dialogue should be natural, with some slang, interruptions, and overlapping thoughts. It should feel unscripted and authentic.",
+            "Serious Debate": "Construct a structured argument with clear points and counterpoints. The hosts should challenge each other's views respectfully but firmly. The tone should be formal, intellectual, and persuasive.",
+            "Story Mode": "Narrate a compelling story based on the research. Use descriptive language to build atmosphere and suspense. The dialogue should reveal the story piece by piece.",
+            "Documentary": "Follow a formal, narrative structure like a classic documentary. The host acts as a narrator, guiding the listener through the topic with clarity and authority.",
+            "ASMR": "The script should focus on soft, gentle, and relaxing words. Emphasize crisp consonant sounds and create a calming, quiet atmosphere. Keep sentences short and paced slowly."
         }
         
         language_instruction = "The entire script must be in English."
         if config.get("LANGUAGE_ENABLED", False):
             language = config.get("PODCAST_LANGUAGE", "English")
-            if language.lower() == 'urdu': language_instruction = "The entire script must be in Roman Urdu."
+            if language.lower() == 'urdu': language_instruction = "The entire script, including dialogue, must be in Roman Urdu."
             else: language_instruction = f"The entire script must be in {language}."
         
         length_instruction = f"- The total word count must be appropriate for a '{script_length}' spoken podcast."
+        placement_instruction = (f"- Insert about {sub_count} reminders randomly within the host's dialogue." if randomize else f"- Insert exactly {sub_count} reminders evenly spaced within the host's dialogue.")
         story_arc_prompt = f"- Structure the script to follow the '{story_arc}' narrative arc." if story_arc != "None" else ""
-        
-        if is_podcast_mode:
-            logging.info("Generating DUAL-SPEAKER script for Podcast mode.")
-            host, guest = config.get("HOST_NAME","Alex"), config.get("GUEST_NAME","Maya")
-            host_persona, guest_persona = config.get("HOST_PERSONA"), config.get("GUEST_PERSONA")
-            sub_count, sub_message = config.get("SUBSCRIBE_COUNT"), config.get("SUBSCRIBE_MESSAGE").replace("{channel}", config.get("CHANNEL_NAME","My AI Channel"))
-            placement_instruction = (f"- Insert about {sub_count} reminders randomly within the host's dialogue." if config.get("SUBSCRIBE_RANDOM") else f"- Insert exactly {sub_count} reminders evenly spaced.")
-            
-            prompt = f"""
-            You are an expert podcast scriptwriter for a show named "{config.get("CHANNEL_NAME")}". Your task is to write a script that sounds 100% natural and unscripted.
-            **TOPIC:** {topic}
-            **HOSTS & PERSONAS:**
-            - **Host ({host}):** {host_persona}
-            - **Guest ({guest}):** {guest_persona}
-            **TONE & STYLE ({style}):**
-            - **Core Instruction:** {style_instructions.get(style)}
-            **DIALOGUE DYNAMICS (CRITICAL):**
-            - Simulate a real, spontaneous conversation. Use natural fillers ("Right," "Wow," "So...").
-            - Keep speaking turns to 2-3 sentences.
-            - The host must react, not just ask questions.
-            - Script natural interjections and interruptions.
-            **REQUIRED STRUCTURE:**
-            - A. Cold Open/Hook
-            - B. Introduction
-            - C. Main Discussion
-            - D. Conclusion
-            - E. Outro
-            **AUDIENCE ENGAGEMENT:**
-            - Reminder Message: "{sub_message}"
-            - {placement_instruction} (Do not place in intro/outro).
-            **FORMATTING & LANGUAGE RULES:**
-            - EVERY line must start with either `{host}:` or `{guest}:`.
-            - Hosts must take turns speaking.
-            - {language_instruction}
-            - {length_instruction}
-            {story_arc_prompt}
-            **RESEARCH MATERIAL TO USE:**
-            ```
-            {research}
-            ```
-            Generate the complete script now.
-            """
-        else: # For Documentary, Story, ASMR, etc.
-            logging.info(f"Generating SINGLE-SPEAKER script for {content_style} mode.")
-            narrator_persona = config.get("HOST_PERSONA")
-            
-            prompt = f"""
-            You are an expert scriptwriter for a {content_style} video. Your task is to write a compelling narration.
-            **TOPIC:** {topic}
-            **NARRATOR & PERSONA:**
-            - **Narrator:** {narrator_persona}
-            **TONE & STYLE ({style}):**
-            - **Core Instruction:** {style_instructions.get(style)}
-            **SCRIPT REQUIREMENTS:**
-            - This is a single-voice narration.
-            - Use descriptive language suitable for the content style: '{content_style}'.
-            - Use punctuation to guide vocal delivery and rhythm.
-            **REQUIRED STRUCTURE:**
-            - A. Hook
-            - B. Introduction
-            - C. Main Body (detailed exploration of research)
-            - D. Conclusion
-            **FORMATTING & LANGUAGE RULES:**
-            - The output must be the raw script text only. DO NOT use any speaker prefixes like "Narrator:".
-            - {language_instruction}
-            - {length_instruction}
-            {story_arc_prompt}
-            **RESEARCH MATERIAL TO USE:**
-            ```
-            {research}
-            ```
-            Generate the complete narration script now.
-            """
 
-        response = self.text_model.generate_content(prompt)
+        prompt = f"""
+        You are an expert podcast scriptwriter. Your task is to write a script that sounds 100% natural and unscripted, like a real, spontaneous conversation.
+        The dialogue MUST NOT sound like two people reading prepared statements. It must sound like the hosts are truly reacting to each other in real-time.
+
+        **1. TOPIC:** {topic}
+        **2. HOSTS & PERSONAS (Embody these traits):**
+        - **Host ({host}):** {host_persona}
+        - **Guest ({guest}):** {guest_persona}
+
+        **3. TONE & STYLE ({style}):**
+        - **Core Instruction:** {style_instructions.get(style, "A standard, informative conversation.")}
+
+        **4. DIALOGUE DYNAMICS (MOST CRITICAL RULES):**
+        Your primary goal is to simulate a real conversation.
+        - **NATURAL FILLERS:** Integrate conversational fillers NATURALLY. People say "Right," "Exactly," "Wow," "So...", "I mean," "You know," and "Hmm."
+        - **SHORT TURNS:** Keep speaking turns to 2-3 sentences before the other host interjects.
+        - **REACTIONS, NOT JUST QUESTIONS:** The host ({host}) must actively react to the guest ({guest}) with phrases like "Wow, that's incredible," or "Right, and that leads to..."
+        - **SCRIPTED INTERRUPTIONS:** Script natural interjections. For example:
+            {guest}: So the data shows a 50% increase...
+            {host}: Fifty percent? Wow.
+            {guest}: Exactly. And that's just in the last quarter.
+        - **CADENCE:** Use punctuation (commas, ellipses) to create realistic pauses.
+
+        **5. REQUIRED SHOW STRUCTURE:**
+        - **A. Cold Open/Hook:** Start with a provocative question or a surprising fact.
+        - **B. Introduction:** The host introduces the show, topic, and guest.
+        - **C. Main Discussion:** The highly conversational back-and-forth based on the research.
+        - **D. Conclusion:** The host summarizes the key takeaways.
+        - **E. Outro:** The host thanks the guest and signs off.
+
+        **6. AUDIENCE ENGAGEMENT:**
+        - **Reminder Message:** "{sub_message}"
+        - **Placement:** {placement_instruction} Do NOT place reminders in the intro or outro.
+
+        **7. FORMATTING & LANGUAGE RULES:**
+        - **Line Prefixes:** EVERY line must start with either `{host}:` or `{guest}:`.
+        - **Alternating Speakers:** The hosts must take turns speaking.
+        - {language_instruction}
+        - {length_instruction}
+        {story_arc_prompt}
+
+        **8. RESEARCH MATERIAL TO USE:**
+        ```
+        {research}
+        ```
+
+        Generate the complete, 100% natural-sounding podcast script.
+        """
+        
+        response = self.text_model.generate_content(prompt, safety_settings={'HARM_CATEGORY_DANGEROUS_CONTENT': 'BLOCK_NONE'})
         return response.text
 
     @handle_api_errors
     def generate_image_prompt_for_segment(self, content_style: str, topic: str, script_segment: str) -> str:
+        """
+        Generates a context-aware image prompt based on the content style and a specific script segment.
+        """
         logging.info(f"Generating image prompt for segment based on style: '{content_style}'...")
-        base_prompt = f"A high-quality image for a {content_style} about: {topic}."
+        
+        base_prompt_map = {
+            "Podcast": f"A high-quality, professional still image capturing the essence of a podcast discussion. Focus on the core theme of: {topic}.",
+            "ASMR Video": f"A serene, calming image suitable for an ASMR video, subtly related to: {topic}. Soft lighting, peaceful atmosphere.",
+            "Documentary": f"A powerful, visually rich documentary-style still image, representing a key moment or concept from: {topic}. Dramatic lighting, realistic.",
+            "Product Ad": f"A high-end, commercial product advertisement image, highlighting a feature or benefit related to: {topic}. Clean, vibrant, appealing.",
+            "Story": f"An illustrative, evocative image depicting a scene from a story about: {topic}. Focus on emotional resonance and narrative elements.",
+            "Kids Story": f"A vibrant, friendly, and imaginative illustration for a children's story about: {topic}. Bright colors, whimsical style.",
+            "Horror Story": f"A dark, atmospheric, and unsettling image for a horror story about: {topic}. Focus on suspense, shadows, and subtle dread.",
+            "Viral Video": f"A dynamic, attention-grabbing, and slightly exaggerated image suitable for a viral video about: {topic}. Energetic, bold, and clear."
+        }
+        base_prompt = base_prompt_map.get(content_style, f"A high-quality image related to the topic of {topic}.")
+
         refinement_prompt = (
             f"You are an expert at creating image prompts. Your task is to generate a single, concise, and visually descriptive prompt for an AI image generator. "
             f"The image should visually represent the key idea from the following script segment: '{script_segment}'. "
             f"The overall style of the image must be: '{base_prompt}'. "
-            f"**CRITICAL SAFETY RULE:** The generated prompt must be safe for work and adhere to AI safety policies. Do not include direct references to violence, gore, or specific controversial political figures. Instead, focus on creating a visually symbolic or thematic representation. For example, instead of a specific political conflict, describe 'a shattered chess board' or 'two opposing flags on a stormy background'."
-            "Output ONLY the final image prompt."
+            "Do not output any conversational text, explanations, or quotes. Output ONLY the final image prompt."
         )
+        
         response = self.text_model.generate_content(refinement_prompt)
         return response.text.strip().replace('"', '')
 
     @handle_api_errors
     def generate_thumbnail_prompts(self, topic: str, title_text: str) -> dict:
-        logging.info("Generating dynamic prompts for split-screen thumbnail (character only)...")
+        """
+        Generates two separate prompts for a split-screen thumbnail.
+        """
+        logging.info("Generating dynamic prompts for split-screen thumbnail...")
         
-        # --- FIX: This prompt asks for ONE prompt for the character photo. ---
-        # The text side will be handled by ffmpeg in the pipeline.
         prompt = f"""
-        Act as a viral YouTube thumbnail designer. Generate ONE descriptive image prompt for a photorealistic, emotional character relevant to the topic.
-        
-        Focus on the *emotion* (shock, surprise, thought) and the *theme* of the topic. The character must be safe for work.
-        
+        Act as a viral YouTube thumbnail designer. Your task is to generate two separate image prompts for a split-screen thumbnail based on the video's topic and title.
+
+        The final thumbnail will have a photorealistic character on the left and bold text on the right.
+
         VIDEO TOPIC: {topic}
-        
-        Your entire response MUST be a single, valid JSON object with one key: "character_prompt".
+        VIDEO TITLE: {title_text}
+
+        CRITICAL INSTRUCTIONS:
+        1.  **Character Prompt:** Create a prompt for the left side. It must describe a single character (male, female, child, or animal) that is highly relevant to the topic. The character MUST have a strong, emotional expression like shock, amazement, or excitement. Describe the scene, lighting, and style (e.g., "photorealistic, cinematic lighting, close-up shot...").
+        2.  **Text Prompt:** Create a prompt for the right side. It must describe a graphic design with the video title as the main text. Specify background colors (e.g., "dark navy blue with a subtle gradient"), font style (e.g., "large, bold, impactful font"), and text colors (e.g., "main text in white, with key words like 'SHOCKING' or 'FREE' highlighted in bright yellow").
+
+        Your entire response MUST be a single, valid JSON object with two keys: "character_prompt" and "text_prompt". Do not include any other text or formatting.
         """
         
         response = self.text_model.generate_content(prompt, generation_config={"response_mime_type": "application/json"})
@@ -332,46 +331,82 @@ class GoogleClient:
             return json.loads(response.text)
         except json.JSONDecodeError:
             logging.error(f"Failed to decode JSON for thumbnail prompts. Raw response: {response.text}")
-            # Updated the fallback
+            # Provide a robust fallback if JSON parsing fails
             return {
-                "character_prompt": f"A photorealistic, cinematic close-up of a person looking shocked and amazed, reacting to the theme of '{topic}'."
+                "character_prompt": f"A photorealistic, cinematic close-up of a person looking shocked and amazed, reacting to the topic of '{topic}'.",
+                "text_prompt": f"A graphic design for a YouTube thumbnail title card. A dark blue background with the text '{title_text}' in large, bold, yellow and white font."
             }
-
+    
+    # --- THIS FUNCTION REPLACES THE OLD, BROKEN ONE ---
     @handle_api_errors
     def generate_chapter_titles(self, script: str) -> list:
+        """
+        Analyzes the script and returns a JSON list of logical chapter titles.
+        This is a fast query that does NOT send timestamp data.
+        """
         logging.info("Identifying logical chapter titles from script...")
         prompt = f"""
         You are a video editor. Read the following podcast script. Your task is to identify 5-10 main logical chapters or topic shifts in the conversation.
         The first chapter MUST be "Intro".
+
+        CRITICAL FORMATTING:
         Return ONLY a valid JSON list of strings and nothing else. Do not add explanations.
-        Example: ["Intro", "The Early Days", "A Surprising Discovery", "Conclusion"]
+
+        Example Output:
+        ["Intro", "The Early Days", "A Surprising Discovery", "The Final Confrontation", "Conclusion"]
+
         --- SCRIPT ---
         {script}
         --- END SCRIPT ---
+
         Generate the JSON list of chapter titles now.
         """
+        
         response = self.text_model.generate_content(prompt, generation_config={"response_mime_type": "application/json"})
+        
         try:
-            text = response.text.strip().replace("```json", "").replace("```", "")
-            return json.loads(text)
-        except (json.JSONDecodeError, AttributeError):
-            logging.error(f"Failed to parse chapter titles JSON. Raw: {getattr(response, 'text', 'NO TEXT')}")
+            return json.loads(response.text)
+        except json.JSONDecodeError:
+            logging.error(f"Failed to parse chapter titles JSON. Raw: {response.text}")
+            # Fallback to just the intro
             return ["Intro"]
 
-    # --- gemini_nanobanana_image function REMOVED to prevent crashes ---
+
+    @handle_api_errors
+    def gemini_nanobanana_image(self, prompt: str, output_path: str):
+        """
+        Generates an image using the gemini-2.5-flash-image-preview model.
+        """
+        logging.info(f"Generating image with Gemini API (gemini-2.5-flash-image-preview): '{prompt}'")
+        model = genai.GenerativeModel(NANO_BANANA_IMAGE_MODEL)
+        
+        response = model.generate_content(prompt) # Corrected call
+        
+        image_part = response.candidates[0].content.parts[0]
+        if "image" not in image_part.mime_type:
+            raise RuntimeError(f"API did not return an image. It may have returned text instead: {response.text}")
+        
+        image_data = image_part.inline_data.data
+        
+        with open(output_path, "wb") as f: 
+            f.write(base64.b64decode(image_data))
+        
+        logging.info(f"Image successfully saved to {output_path}")
 
     @handle_api_errors
     def vertex_nanobanana_image(self, prompt: str, output_path: str):
+        """Generates an image using the stable Imagen 3 model on Vertex AI."""
         if not vertexai or not ImageGenerationModel:
-            raise RuntimeError("Vertex AI libraries not installed correctly.")
+            raise RuntimeError("Vertex AI libraries not installed correctly. Please run: pip install --upgrade google-cloud-aiplatform vertexai")
         
-        if not self.project_id or not self.location:
-            raise ValueError("GCP Project ID and Location must be set in Settings to use Vertex AI Image Generation.")
-            
         logging.info(f"Generating image with Vertex AI (Imagen 3): '{prompt}'")
         vertexai.init(project=self.project_id, location=self.location)
-        model = ImageGenerationModel.from_pretrained("imagen-3.0-generate-002") # Using a known stable model
-        response = model.generate_images(prompt=prompt, number_of_images=1, aspect_ratio="16:9")
+        model = ImageGenerationModel.from_pretrained("imagen-3.0-generate-002")
+        response = model.generate_images(
+            prompt=prompt,
+            number_of_images=1,
+            aspect_ratio="16:9" # This is fine, will be cropped by ffmpeg later
+        )
         response[0].save(location=output_path, include_generation_parameters=True)
         logging.info(f"Vertex AI image successfully saved to {output_path}")
 
@@ -394,19 +429,21 @@ class GoogleClient:
     def generate_tts(self, script: str, output_path: str, tts_config: dict):
         logging.info("Generating audio with real Gemini TTS...")
         
-        script_for_api = script.split('Text :')[-1].strip() if 'Text :' in script else script
+        logging.info("Sanitizing script for TTS...")
+        if 'Text :' in script:
+            script_for_api = script.split('Text :')[-1].strip()
+        else:
+            script_for_api = script
         
         api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_TTS_MODEL}:generateContent?key={self.api_key}"
         
-        is_podcast_mode = tts_config.get("CONTENT_STYLE") == "Podcast"
+        is_multi_speaker_script = False
         host_name = tts_config.get("HOST_NAME", "Alex")
         guest_name = tts_config.get("GUEST_NAME", "Maya")
         
-        is_multi_speaker_script = is_podcast_mode and f"{host_name}:" in script_for_api and f"{guest_name}:" in script_for_api
-        if is_multi_speaker_script:
+        if f"{host_name}:" in script_for_api and f"{guest_name}:" in script_for_api:
+            is_multi_speaker_script = True
             logging.info("Multi-speaker script detected. Forcing multi-speaker TTS mode.")
-        else:
-            logging.info("Single-speaker script detected. Using single voice.")
 
         CHUNK_SIZE_LIMIT = 4500
         script_lines = script_for_api.split('\n')
@@ -415,14 +452,20 @@ class GoogleClient:
 
         for line in script_lines:
             if len(current_chunk) + len(line) + 1 > CHUNK_SIZE_LIMIT:
-                if current_chunk: script_chunks.append(current_chunk)
+                if current_chunk:
+                    script_chunks.append(current_chunk)
                 current_chunk = line
             else:
-                current_chunk = f"{current_chunk}\n{line}" if current_chunk else line
-        if current_chunk: script_chunks.append(current_chunk)
+                if current_chunk:
+                    current_chunk += "\n" + line
+                else:
+                    current_chunk = line
+        
+        if current_chunk:
+            script_chunks.append(current_chunk)
 
         if len(script_chunks) > 1:
-            logging.info(f"Script is long, splitting into {len(script_chunks)} chunks to ensure quality.")
+            logging.info(f"Script is long, intelligently splitting into {len(script_chunks)} chunks to ensure quality.")
 
         all_audio_data = []
 
@@ -445,20 +488,26 @@ class GoogleClient:
                     {"speaker": guest_name, "voiceConfig": {"prebuiltVoiceConfig": {"voiceName": tts_config["SPEAKER2"]}}}
                 ]}}
             else:
-                 payload["generationConfig"]["speechConfig"] = {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": tts_config.get("SPEAKER1", "Kore")}}}
+                 payload["generationConfig"]["speechConfig"] = {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": tts_config.get("VOICE_NAME", "Kore")}}}
 
             
             response = requests.post(api_url, json=payload, timeout=300)
             response.raise_for_status()
             resp_json = response.json()
             candidates = resp_json.get("candidates", [])
-            if not candidates: raise RuntimeError(f"TTS failed: No candidates in response. {resp_json}")
+            if not candidates:
+                raise RuntimeError(f"TTS failed on chunk {i+1}: No candidates in response. Full response: {resp_json}")
             
             parts = candidates[0].get("content", {}).get("parts", [])
-            if not parts: raise RuntimeError(f"TTS failed: No content parts. Finish Reason: '{candidates[0].get('finishReason', 'UNKNOWN')}'.")
+            if not parts:
+                finish_reason = candidates[0].get('finishReason', 'UNKNOWN')
+                error_message = (f"TTS failed on chunk {i+1}: API returned no content parts. Finish Reason: '{finish_reason}'.")
+                raise RuntimeError(error_message)
 
             audio_data = parts[0].get("inlineData", {}).get("data")
-            if not audio_data: raise RuntimeError(f"TTS failed: No audio data. API may have returned text: '{parts[0].get('text', '')}'")
+            if not audio_data:
+                text_fallback = parts[0].get("text", "")
+                raise RuntimeError(f"TTS failed on chunk {i+1}: No audio data found. API may have returned a text fallback: '{text_fallback}'")
             
             all_audio_data.append(base64.b64decode(audio_data))
 
@@ -470,60 +519,54 @@ class GoogleClient:
 
     @handle_api_errors
     def generate_video_prompt(self, topic: str, research: str, style_guide: str) -> str:
+        """Generates a dynamic, context-aware video prompt based on research."""
         logging.info("Generating dynamic video prompt...")
+        
         prompt = f"""
         You are an expert prompt engineer for a text-to-video AI model. 
         Your task is to create a SINGLE, highly descriptive video prompt.
+        
         RULES:
-        1. Prompt must be concise (under 100 words).
-        2. Must visually describe a scene, not just name concepts.
-        3. Must incorporate the overall style instructions.
+        1. The prompt must be concise (under 100 words).
+        2. It must visually describe a scene, not just name concepts.
+        3. It must incorporate the overall style instructions.
         4. Output ONLY the final video prompt and nothing else.
+
         TOPIC: {topic}
         STYLE INSTRUCTIONS: {style_guide}
         RESEARCH SUMMARY (for context):
         {research}
+        
         Generate the final, descriptive video prompt now.
         """
+        
         response = self.text_model.generate_content(prompt)
         return response.text.strip().replace('"', '')
 
-    # --- FUNCTION REWRITTEN to use IMAGEN 2 (as requested) ---
     @handle_api_errors
     def vertex_ai_text_to_video(self, prompt: str, output_path: str, aspect_ratio: str):
-        if not vertexai or not VideoGenerationModel: 
-            raise RuntimeError("Vertex AI libraries (including vision_models.VideoGenerationModel) not installed correctly.")
+        if not vertexai: 
+            raise RuntimeError("Vertex AI libraries not installed correctly. Please recreate your environment.")
         
-        if not self.project_id or not self.location:
-            raise ValueError("GCP Project ID and Location must be set in Settings to use Vertex AI Video Generation.")
-
-        logging.info(f"Generating video with Vertex AI (Imagen 2): '{prompt}'")
+        logging.info(f"Generating video with Vertex AI: '{prompt}'")
         vertexai.init(project=self.project_id, location=self.location)
+        model = GenerativeModel(VEO_MODEL_ID)
+        final_prompt = f"{prompt} The video must be in a {aspect_ratio} aspect ratio."
         
-        # This uses the specific Imagen 2 model, fulfilling the "Veo 2" request
-        model = VideoGenerationModel.from_pretrained("imagen-2.0-generate-video-002")
-        
-        # Imagen 2 uses width/height, not an aspect ratio string. Using standard SD sizes.
-        width, height = (640, 368) if aspect_ratio == "16:9 (Horizontal)" else (368, 640)
-
-        logging.info(f"Sending video generation request to Vertex AI (Imagen 2) with size {width}x{height}...")
-        
-        # Call the model
-        response = model.generate(
-            prompt=prompt,
-            generation_config={
-                "width": width,
-                "height": height,
-                "number_of_videos": 1
-            }
+        logging.info("Sending video generation request to Vertex AI (this may take several minutes)...")
+        response = model.generate_content(
+            [final_prompt],
+            generation_config={"response_mime_type": "video/mp4"}
         )
-        
-        video_bytes = response[0].video_bytes
-        if not video_bytes:
-             raise RuntimeError("Vertex AI (Imagen 2) did not return a video.")
 
+        video_part = response.candidates[0].content.parts[0]
+        if "video" not in video_part.mime_type:
+            raise RuntimeError(f"Vertex AI did not return a video. Response: {response.text}")
+            
+        video_bytes = video_part._raw_part.inline_data.data
         with open(output_path, "wb") as f:
             f.write(video_bytes)
+        
         logging.info(f"Vertex AI video saved to {output_path}")
 
 
