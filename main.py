@@ -35,7 +35,6 @@ from pipeline import Pipeline
 from api_clients import GoogleClient, NewsApiClient
 
 # --- Constants for GUI Dropdowns ---
-# --- UPDATED STEP ORDER ---
 PIPELINE_STEPS = [
     "Deep Research",
     "Fact Check Research",
@@ -44,16 +43,14 @@ PIPELINE_STEPS = [
     "Generate Thumbnail",
     "Analyze Tone",
     "Audio (TTS)",
-    "Video Generation",        # Background video now generated BEFORE timed images
-    "Generate Timed Images",   # <-- MOVED HERE
+    "Generate Timed Images",
+    "Video Generation",
     "Add Background Music", 
     "Create Final Video",
-    "Generate SEO Metadata",
-    "Generate Timestamps",
+    "Generate SEO Metadata",   # <-- MOVED UP
+    "Generate Timestamps",     # <-- MOVED DOWN
     "Generate Snippets"
 ]
-# --- END UPDATED STEP ORDER ---
-
 VOICE_OPTIONS = {
     "Achernar": "Clear, mid-range, enthusiastic & approachable", "Achird": "Youthful, breathy, inquisitive tone",
     "Algenib": "Warm, confident, friendly authority", "Alnilam": "Energetic, low pitch, promotional tone",
@@ -94,7 +91,7 @@ class TextboxHandler(logging.Handler):
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("🎙️ Nullpk Ai Content Studio")
+        self.title("🎙️ Nullpk Content Automation")
         self.geometry("1100x950")
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
@@ -315,7 +312,7 @@ class App(ctk.CTk):
         upload_frame.grid(row=9, column=0, columnspan=3, pady=10)
         self.youtube_upload_button = ctk.CTkButton(upload_frame, text="Upload to YouTube", command=self.start_youtube_upload_thread, fg_color="#FF0000", hover_color="#8c0303")
         self.youtube_upload_button.pack(side="left", padx=10)
-        self.facebook_upload_button = ctk.CTkButton(upload_frame, text="Upload to Facebook", command=self.start_facebook_upload_thread, fg_color="#1877F2", hover_color="#1456b3")
+        self.facebook_upload_button = ctk.CTkButton(upload_frame, text="Upload to Facebook", command=lambda: self.upload_facebook(), fg_color="#1877F2", hover_color="#1456b3")
         self.facebook_upload_button.pack(side="left", padx=10)
         
         ctk.CTkLabel(self.publish_tab, text="--- API Credentials for Publishing ---", font=("Arial", 12, "bold")).grid(row=10, column=0, columnspan=3, pady=(20,5), padx=10, sticky="w")
@@ -323,7 +320,7 @@ class App(ctk.CTk):
         self.facebook_token_entry = ctk.CTkEntry(self.publish_tab, width=400, show="*", placeholder_text="User/Page access token"); self.facebook_token_entry.grid(row=11, column=1, columnspan=2, sticky="ew", padx=10, pady=5)
     
     def _create_about_tab_widgets(self):
-        ctk.CTkLabel(self.about_tab, text="Nullpk Ai Content Studio", font=("Arial", 20, "bold")).pack(pady=(40, 10))
+        ctk.CTkLabel(self.about_tab, text="Nullpk Content Automation", font=("Arial", 20, "bold")).pack(pady=(40, 10))
         ctk.CTkLabel(self.about_tab, text="Version 3.2 (Slideshow Mode)", font=("Arial", 12)).pack(pady=5)
         ctk.CTkLabel(self.about_tab, text="Author: Naqash Afzal", font=("Arial", 12)).pack(pady=5)
         ctk.CTkLabel(self.about_tab, text="This tool automates the creation of YouTube videos using AI.", wraplength=500).pack(pady=20)
@@ -365,30 +362,25 @@ class App(ctk.CTk):
     def start_pipeline_thread(self):
         topic = self.topic_entry.get().strip()
         if not topic: messagebox.showerror("Error", "Please enter a topic."); return
-        
-        self.update_config_from_all_gui()
-
         if not self.config.get("GEMINI_API_KEY"): messagebox.showerror("API Key Missing", "Please enter your Gemini API key in Settings."); return
-        
-        # --- UPDATED CHECK: Ensure Project ID is set, since Vertex is now required for images ---
-        if self.config.get("GENERATE_THUMBNAIL") or self.config.get("GENERATE_TIMED_IMAGES"):
-             if not self.config.get("GCP_PROJECT_ID") or not self.config.get("GCP_LOCATION"):
-                messagebox.showerror("GCP Project Missing", "Image generation now requires Vertex AI. Please enter your GCP Project ID and Location in Settings to proceed.")
-                return
         
         self.run_button.configure(state="disabled"); self.stop_button.configure(state="normal")
         self.stop_event.clear()
         for i in range(len(PIPELINE_STEPS)): self.update_status_callback(i, "⬜", 0)
         
-        on_finish_callback = lambda success, error: self.after(0, self.on_pipeline_finished, success, topic, error)
+        # This function syncs all GUI settings to the in-memory config dict
+        self.update_config_from_all_gui()
         
+        on_finish_callback = lambda success: self.after(0, self.on_pipeline_finished, success, topic)
+        
+        # Pass all three callbacks to the pipeline instance
         pipeline_instance = Pipeline(
             self.config, 
             self.stop_event, 
             self.update_status_callback, 
-            self.update_seo_callback,
+            self.update_seo_callback,          # Callback for SEO
             on_finish_callback,
-            self.update_timestamps_callback
+            self.update_timestamps_callback    # Callback for Timestamps
         )
         threading.Thread(target=pipeline_instance.run, args=(topic, self.start_step_combo.get()), daemon=True).start()
     
@@ -397,25 +389,21 @@ class App(ctk.CTk):
         self.stop_event.set()
         self.run_button.configure(state="normal"); self.stop_button.configure(state="disabled")
 
-    def on_pipeline_finished(self, success: bool, topic: str, error: Exception):
+    def on_pipeline_finished(self, success: bool, topic: str):
         """Handles UI updates when the pipeline completes, fails, or is stopped."""
         self.run_button.configure(state="normal")
         self.stop_button.configure(state="disabled")
         self.update_history_tab()
         if success:
             messagebox.showinfo("Pipeline Complete", f"Successfully generated content for topic:\n'{topic}'")
-        else:
-            if not self.stop_event.is_set():
-                error_message = f"The pipeline stopped due to an error:\n\n{str(error)}\n\nPlease check the logs for details."
-                messagebox.showerror("Pipeline Failed", error_message)
     
     def update_seo_callback(self, metadata):
         """Safely updates the publish tab UI with title, description, and tags. THIS RUNS FIRST."""
         def update_ui():
             self.video_title_entry.delete(0, "end")
             self.video_title_entry.insert(0, metadata.get("title", ""))
-            self.video_desc_entry.delete("1.0", "end")
-            self.video_desc_entry.insert("1.0", metadata.get("description", ""))
+            self.video_desc_entry.delete("1.0", "end") # This CLEARS the box
+            self.video_desc_entry.insert("1.0", metadata.get("description", "")) # This SETS the description
             self.video_tags_entry.delete(0, "end")
             self.video_tags_entry.insert(0, metadata.get("tags", ""))
             logging.info("📝 SEO metadata has been pre-filled in the Publish tab.")
@@ -426,6 +414,7 @@ class App(ctk.CTk):
         if not timestamps_text:
             return
         def update_ui():
+            # This APPENDS to the description, which was already set by the SEO callback
             self.video_desc_entry.insert("end", timestamps_text) 
             logging.info("⏰ Timestamps have been appended to the description.")
         self.after(0, update_ui)
@@ -433,10 +422,12 @@ class App(ctk.CTk):
     def update_config_from_all_gui(self):
         """
         Synchronizes the in-memory self.config dictionary with the current state
-        of ALL relevant UI elements.
+        of ALL relevant UI elements. This ensures the pipeline runs with the settings
+        the user currently sees.
         """
         logging.info("Syncing all current GUI settings to in-memory config for pipeline run...")
         
+        # Main Tab Checkboxes
         self.config["FACT_CHECK_ENABLED"] = self.fact_check_var.get()
         self.config["GENERATE_METADATA"] = self.metadata_var.get()
         self.config["GENERATE_TIMESTAMPS"] = self.timestamps_var.get()
@@ -448,6 +439,7 @@ class App(ctk.CTk):
         self.config["TIMED_IMAGES_AS_SLIDESHOW"] = self.slideshow_var.get()
         self.config["CONTENT_STYLE"] = self.content_style_combo.get()
         
+        # Settings Tab (API)
         self.config["GEMINI_API_KEY"] = self.gemini_key_entry.get().strip()
         self.config["WAVESPEED_AI_KEY"] = self.wavespeed_key_entry.get().strip()
         self.config["GCP_PROJECT_ID"] = self.gcp_project_entry.get().strip()
@@ -456,6 +448,7 @@ class App(ctk.CTk):
         self.config["VIDEO_ENGINE"] = self.video_engine_combo.get()
         self.config["IMAGE_ENGINE"] = self.image_engine_combo.get()
 
+        # Settings Tab (Personalization)
         self.config["TTS_MODE"] = self.tts_mode_combo.get()
         self.config["VOICE_NAME"] = self._extract_voice_name(self.voice_combo.get())
         self.config["SPEAKER1"] = self._extract_voice_name(self.speaker1_combo.get())
@@ -465,6 +458,7 @@ class App(ctk.CTk):
         self.config["HOST_PERSONA"] = self.host_persona_entry.get("1.0", "end-1c").strip()
         self.config["GUEST_PERSONA"] = self.guest_persona_entry.get("1.0", "end-1c").strip()
 
+        # Settings Tab (Advanced)
         self.config["PODCAST_STYLE"] = self.style_combo.get()
         self.config["STORY_ARC"] = self.story_arc_combo.get()
         self.config["SCRIPT_LENGTH"] = self.script_length_combo.get()
@@ -479,6 +473,14 @@ class App(ctk.CTk):
         self.config["VIDEO_PROMPT_BASE_STYLE"] = self.video_style_textbox.get("1.0", "end-1c").strip()
         self.config["IMAGE_PROMPT_STYLE"] = self.image_style_textbox.get("1.0", "end-1c").strip()
         
+    
+    def save_settings_from_gui(self):
+        """
+        Updates the in-memory config from the GUI and then saves it to config.json.
+        """
+        self.update_config_from_all_gui()
+        
+        self.config["FACEBOOK_ACCESS_TOKEN"] = self.facebook_token_entry.get().strip()
         self.config["CHANNEL_NAME"] = self.channel_entry.get().strip() or "My AI Channel"
         try: 
             self.config["SUBSCRIBE_COUNT"] = int(self.sub_count_entry.get())
@@ -486,13 +488,7 @@ class App(ctk.CTk):
             self.config["SUBSCRIBE_COUNT"] = 3
         self.config["SUBSCRIBE_MESSAGE"] = self.sub_message_entry.get().strip()
         self.config["SUBSCRIBE_RANDOM"] = self.subscribe_random_var.get()
-    
-    def save_settings_from_gui(self):
-        """
-        Updates the in-memory config from the GUI and then saves it to config.json.
-        """
-        self.update_config_from_all_gui() 
-        self.config["FACEBOOK_ACCESS_TOKEN"] = self.facebook_token_entry.get().strip()
+        
         save_config(self.config)
         messagebox.showinfo("Success", "Settings have been saved successfully.")
     
@@ -569,15 +565,11 @@ class App(ctk.CTk):
         if not topic: messagebox.showerror("Error", "Please enter a topic first."); return
         logging.info("📄 Generating SEO metadata only...")
         try:
-            self.config["GEMINI_API_KEY"] = self.gemini_key_entry.get().strip()
-            self.config["NEWS_API_KEY"] = self.news_api_key_entry.get().strip()
-
             google_client = GoogleClient(self.config['GEMINI_API_KEY'], self.config.get("GCP_PROJECT_ID"), self.config.get("GCP_LOCATION"))
             news_client = NewsApiClient(self.config.get("NEWS_API_KEY"))
-            
             research = google_client.deep_research(topic, self.config.get("PODCAST_LANGUAGE", "English"), news_client)
-            metadata = google_client.generate_seo_metadata(topic, context=research) 
-            
+            script = google_client.generate_podcast_script(topic, research, self.config) # Generate a dummy script for context
+            metadata = google_client.generate_seo_metadata(topic, script)
             self.video_title_entry.delete(0, ctk.END); self.video_title_entry.insert(0, metadata.get("title", ""))
             self.video_desc_entry.delete("1.0", ctk.END); self.video_desc_entry.insert("1.0", metadata.get("description", ""))
             self.video_tags_entry.delete(0, ctk.END); self.video_tags_entry.insert(0, metadata.get("tags", ""))
@@ -605,8 +597,8 @@ class App(ctk.CTk):
                     credentials.refresh(Request())
                 except Exception as e:
                     logging.error(f"Failed to refresh token: {e}")
-                    pickle_file.unlink()
-                    credentials = None
+                    pickle_file.unlink() # Delete bad token
+                    credentials = None # Force re-authentication
             if not credentials:
                 flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRETS_FILE, scopes=["https://www.googleapis.com/auth/youtube.upload"], redirect_uri='http://localhost:8080/')
                 credentials = flow.run_local_server(port=8080)
@@ -632,7 +624,7 @@ class App(ctk.CTk):
             return
 
         self.youtube_upload_button.configure(state="disabled")
-        self.update_upload_progress("Starting YouTube upload...", 0)
+        self.update_upload_progress("Starting upload...", 0)
 
         upload_thread = threading.Thread(
             target=self.upload_youtube_logic,
@@ -680,37 +672,16 @@ class App(ctk.CTk):
             messagebox.showerror("Upload Error", f"An error occurred during upload: {e}")
         finally:
             self.after(0, self.youtube_upload_button.configure, {"state": "normal"})
-            self.after(0, self.update_upload_progress, ("", 0.0))
 
-    def start_facebook_upload_thread(self):
-        """Starts the Facebook upload process in a separate thread."""
+    def upload_facebook(self):
         safe_topic = re.sub(r'[\\/:*?"<>|]', '', self.topic_entry.get().strip())
         video_path = self.video_path_entry.get().strip() or os.path.join(safe_topic, "final_podcast_video.mp4")
-        
-        if not os.path.exists(video_path): 
-            messagebox.showerror("Error", f"Video not found at '{video_path}'."); return
-            
-        access_token = self.facebook_token_entry.get().strip()
-        if not access_token: 
-            messagebox.showerror("Error", "Facebook Access Token not found in Settings."); return
-
-        self.facebook_upload_button.configure(state="disabled")
-        self.update_upload_progress("Starting Facebook upload...", 0)
-
-        upload_thread = threading.Thread(
-            target=self.upload_facebook_logic,
-            args=(video_path, access_token, self.video_title_entry.get(), self.video_desc_entry.get("1.0", ctk.END)),
-            daemon=True
-        )
-        upload_thread.start()
-
-    def upload_facebook_logic(self, video_path, access_token, title, description):
-        """The core logic for uploading to Facebook, designed to be run in a thread."""
+        if not os.path.exists(video_path): messagebox.showerror("Error", f"Video not found at '{video_path}'."); return
+        access_token = self.config.get("FACEBOOK_ACCESS_TOKEN", "")
+        if not access_token: messagebox.showerror("Error", "Facebook Access Token not found in Settings."); return
+        logging.info("▶️ Uploading to Facebook...")
         try:
-            logging.info("▶️ Uploading to Facebook...")
-            self.update_upload_progress("Initializing Facebook upload...", 0.1)
             with open(video_path, 'rb') as f: video_data = f.read()
-            
             init_url = "https://graph-video.facebook.com/v20.0/me/videos"
             init_params = {"access_token": access_token, "upload_phase": "start", "file_size": os.path.getsize(video_path)}
             init_response = requests.post(init_url, params=init_params).json()
@@ -719,27 +690,17 @@ class App(ctk.CTk):
             upload_session_id = init_response["upload_session_id"]
             upload_url = f"https://graph-video.facebook.com/v20.0/{upload_session_id}"
             upload_headers = {"Authorization": f"OAuth {access_token}", "file_offset": "0"}
-            
-            self.update_upload_progress("Uploading video data to Facebook...", 0.5)
             requests.post(upload_url, headers=upload_headers, data=video_data).json()
 
-            self.update_upload_progress("Finishing Facebook publish...", 0.9)
             finish_url = "https://graph-video.facebook.com/v20.0/me/videos"
             finish_params = {
                 "access_token": access_token, "upload_phase": "finish", "upload_session_id": upload_session_id,
-                "title": title, "description": description
+                "title": self.video_title_entry.get(), "description": self.video_desc_entry.get("1.0", ctk.END)
             }
             requests.post(finish_url, params=finish_params).json()
-            
-            self.update_upload_progress("Upload complete!", 1.0)
             messagebox.showinfo("Upload Complete", "Successfully published to Facebook!")
-            
         except Exception as e:
-            logging.error(f"❌ Facebook upload failed: {e}", exc_info=True)
-            messagebox.showerror("Upload Error", f"An error occurred: {e}")
-        finally:
-            self.after(0, self.facebook_upload_button.configure, {"state": "normal"})
-            self.after(0, self.update_upload_progress, ("", 0.0))
+            logging.error(f"❌ Facebook upload failed: {e}", exc_info=True); messagebox.showerror("Upload Error", f"An error occurred: {e}")
 
 if __name__ == "__main__":
     app = App()
