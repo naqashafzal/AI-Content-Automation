@@ -69,7 +69,7 @@ def load_config():
         "GENERATE_METADATA": False,
         "GENERATE_THUMBNAIL": False,
         "GENERATE_TIMED_IMAGES": False,
-        "GENERATE_TIMESTAMPS": True,
+        "GENERATE_TIMESTAMPS": True, # <-- NEW FEATURE FLAG
         "YOUTUBE_CLIENT_ID": "",
         "YOUTUBE_CLIENT_SECRET": "",
         "FACEBOOK_ACCESS_TOKEN": "",
@@ -110,3 +110,4 @@ def save_config(config_data):
         logging.info("Configuration saved successfully to '%s'.", CONFIG_FILE)
     except Exception as e:
         logging.error("Failed to save configuration file: %s", e)
+
