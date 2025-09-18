@@ -1,9 +1,12 @@
 """
 pipeline.py
 
-This module defines the main content creation pipeline (SEQUENTIAL VERSION).
-(UPDATED to move timed images generation to the end of the pipeline and
- dynamically generate text on thumbnails with ffmpeg to prevent API crashes.)
+This module defines the main content creation pipeline, fully implementing
+all features from the original script in a structured and robust class.
+
+The Pipeline class orchestrates the entire workflow, from research and scriptwriting
+to audio/video generation, captioning, and final processing. It utilizes the
+API client classes and the configuration module to customize its behavior.
 """
 
 import os
@@ -23,7 +26,6 @@ import pysubs2
 from api_clients import GoogleClient, WaveSpeedClient, NewsApiClient
 
 # --- Constants for Pipeline Flow ---
-# --- UPDATED STEP ORDER ---
 PIPELINE_STEPS = [
     "Deep Research",
     "Fact Check Research",
@@ -32,25 +34,23 @@ PIPELINE_STEPS = [
     "Generate Thumbnail",
     "Analyze Tone",
     "Audio (TTS)",
-    "Video Generation",        # Background video now generated BEFORE timed images
-    "Generate Timed Images",   # <-- MOVED HERE
+    "Generate Timed Images",
+    "Video Generation",
     "Add Background Music", 
     "Create Final Video",
-    "Generate SEO Metadata",
-    "Generate Timestamps",
+    "Generate SEO Metadata", # <-- CORRECTED ORDER
+    "Generate Timestamps",   # <-- CORRECTED ORDER
     "Generate Snippets"
 ]
-# --- END UPDATED STEP ORDER ---
 
-
-# --- Helper Functions ---
+# --- Helper Functions (ported from original script) ---
 
 def format_timestamp(seconds: float) -> str:
     """Converts seconds (float) into MM:SS format."""
     total_seconds = int(seconds)
     minutes = total_seconds // 60
-    seconds_rem = total_seconds % 60
-    return f"{minutes:02}:{seconds_rem:02}"
+    seconds = total_seconds % 60
+    return f"{minutes:02}:{seconds:02}"
 
 def sanitize_for_tts(text: str) -> str:
     """Removes emojis and normalizes text for TTS processing."""
@@ -75,6 +75,7 @@ def sanitize_for_tts(text: str) -> str:
     return text.replace('“', '"').replace('”', '"').replace('’', "'").replace('—', '-').replace('–', '-')
 
 def mix_audio_with_music(podcast_path, music_path, output_path, music_volume_db=-15):
+    """Mixes a podcast audio file with a background music file."""
     logging.info("🎵 Mixing background music...")
     try:
         podcast_audio = AudioSegment.from_file(podcast_path)
@@ -93,7 +94,7 @@ def mix_audio_with_music(podcast_path, music_path, output_path, music_volume_db=
 
 def generate_captions(audio_file, captions_file, language: str):
     """Transcribes audio and generates a styled ASS caption file, returning word timestamps."""
-    logging.info("📝 Transcribing audio... (This is the slow step, may take a moment)...")
+    logging.info("📝 Transcribing audio for captions (this may take a moment)...")
     try:
         model = whisper.load_model("base")
         result = model.transcribe(audio_file, word_timestamps=True, language=language)
@@ -120,6 +121,9 @@ def generate_captions(audio_file, captions_file, language: str):
         return []
 
 def sanitize_ffmpeg_path(path: str) -> str:
+    """
+    Sanitizes a file path for use in an ffmpeg filtergraph, especially for the 'ass' filter on Windows.
+    """
     path = os.path.normpath(path)
     path = path.replace('\\', '/')
     if ':' in path:
@@ -136,7 +140,7 @@ class Pipeline:
         self.update_status = status_callback
         self.update_seo = seo_callback
         self.on_finish = on_finish_callback
-        self.update_timestamps = timestamps_callback
+        self.update_timestamps = timestamps_callback # New callback
         self.google_client = GoogleClient(config.get("GEMINI_API_KEY"), config.get("GCP_PROJECT_ID"), config.get("GCP_LOCATION"))
         self.wavespeed_client = WaveSpeedClient(config.get("WAVESPEED_AI_KEY"))
         self.news_client = NewsApiClient(config.get("NEWS_API_KEY"))
@@ -148,6 +152,7 @@ class Pipeline:
     def _wait(self):
         delay = self.config.get("API_DELAY", 2)
         if delay > 0:
+            logging.info(f"Waiting for {delay} seconds...")
             time.sleep(delay)
 
     def _get_audio_length(self, path):
@@ -158,9 +163,11 @@ class Pipeline:
             try:
                 audio = AudioSegment.from_file(path)
                 return len(audio) / 1000.0
-            except Exception: return 0
+            except Exception:
+                return 0
     
     def _get_step_list(self, start_point: str):
+        """Returns a list of steps to execute based on the start point."""
         try:
             start_index = PIPELINE_STEPS.index(start_point)
             return PIPELINE_STEPS[start_index:]
@@ -168,220 +175,145 @@ class Pipeline:
             logging.error(f"Invalid start point '{start_point}'. Defaulting to start.")
             return PIPELINE_STEPS
 
-    def _get_timestamps_from_titles(self, chapter_titles: list, word_timestamps: list) -> str:
-        """Locally matches AI-generated titles to Whisper's timestamp data."""
-        if not word_timestamps or not chapter_titles:
-            return ""
-
-        logging.info("Matching chapter titles to local timestamp data...")
-        word_map = {}
-        for word_data in word_timestamps:
-            word = re.sub(r'[^\w]', '', word_data['word']).strip().lower()
-            if word and word not in word_map:
-                word_map[word] = word_data['start']
-
-        timestamp_output = "\n\n--- Timestamps ---\n"
-        found_chapters = 0
-        STOP_WORDS = {'a', 'an', 'the', 'is', 'in', 'on', 'of', 'for', 'to', 'with', 'and', 'or', 'but', 'how', 'what', 'when', 'why'}
-
-        for title in chapter_titles:
-            cleaned_title = re.sub(r'[^\w\s]', '', title).strip().lower()
-            title_words = cleaned_title.split()
-            target_word = None
-            for word in title_words:
-                if word not in STOP_WORDS:
-                    target_word = word
-                    break
-            if not target_word and title_words:
-                target_word = title_words[0]
-
-            if target_word and target_word in word_map:
-                start_seconds = word_map[target_word]
-                timestamp_output += f"{format_timestamp(start_seconds)} - {title}\n"
-                found_chapters += 1
-            else:
-                logging.warning(f"Could not find timestamp match for chapter: '{title}' (Searched for word: '{target_word}')")
-
-        return timestamp_output if found_chapters > 0 else ""
-        
-    def _generate_image_with_vertex(self, prompt, path):
-        """Helper function to route all calls to the stable Vertex AI endpoint."""
-        # This function assumes vertex_nanobanana_image exists on google_client
-        self.google_client.vertex_nanobanana_image(prompt, path)
-
     def run(self, topic: str, start_point: str):
         success = False
         self.word_timestamps_for_images = []
-        last_error = None
         try:
             logging.info(f"Starting pipeline for topic: '{topic}' from step: '{start_point}'")
             safe_topic = re.sub(r'[\\/:*?"<>|]', '', topic)
             output_dir = safe_topic
             os.makedirs(output_dir, exist_ok=True)
             
-            summary_file, script_file, audio_file = os.path.join(output_dir, "summary.txt"), os.path.join(output_dir, "podcast_script.txt"), os.path.join(output_dir, "podcast.wav")
-            mixed_audio_file, bg_video_file = os.path.join(output_dir, "podcast_with_music.mp3"), os.path.join(output_dir, "background.mp4")
-            segment_images_dir, final_video_file = os.path.join(output_dir, "segment_images"), os.path.join(output_dir, "final_podcast_video.mp4")
-            image_file, captions_file = os.path.join(output_dir, "generated_image.png"), os.path.join(output_dir, "captions.ass")
+            # --- File Paths ---
+            summary_file = os.path.join(output_dir, "summary.txt")
+            script_file = os.path.join(output_dir, "podcast_script.txt")
+            audio_file = os.path.join(output_dir, "podcast.wav")
+            mixed_audio_file = os.path.join(output_dir, "podcast_with_music.mp3")
+            bg_video_file = os.path.join(output_dir, "background.mp4")
+            segment_images_dir = os.path.join(output_dir, "segment_images")
             os.makedirs(segment_images_dir, exist_ok=True)
+            final_video_file = os.path.join(output_dir, "final_podcast_video.mp4")
+            image_file = os.path.join(output_dir, "generated_image.png") # Final thumbnail path
+            captions_file = os.path.join(output_dir, "captions.ass")
             
-            if start_point != "Deep Research" and not os.path.exists(summary_file): raise FileNotFoundError(f"Missing required file: {summary_file}")
-            if start_point in PIPELINE_STEPS[3:] and not os.path.exists(script_file): raise FileNotFoundError(f"Missing required file: {script_file}")
-            if start_point in PIPELINE_STEPS[6:] and not os.path.exists(audio_file): raise FileNotFoundError(f"Missing required file: {audio_file}")
+            # --- Prerequisite File Checks ---
+            if start_point != "Deep Research" and not os.path.exists(summary_file):
+                raise FileNotFoundError(f"Cannot start from '{start_point}' because a required file is missing: {summary_file}")
+            if start_point in PIPELINE_STEPS[3:] and not os.path.exists(script_file): # From Podcast Script onward
+                 raise FileNotFoundError(f"Cannot start from '{start_point}' because a required file is missing: {script_file}")
+            if start_point in PIPELINE_STEPS[6:] and not os.path.exists(audio_file): # From Audio (TTS) onward
+                 raise FileNotFoundError(f"Cannot start from '{start_point}' because a required file is missing: {audio_file}")
 
             steps_to_run = self._get_step_list(start_point)
-            research, script, audio_len = "", "", 0
+            
+            research, script, seo_title, audio_len = "", "", "", 0
             generated_images_with_times = []
 
+            # --- Research and Scripting ---
             if "Deep Research" in steps_to_run: 
-                self.update_status(0, "⏳", 0.5); research = self.google_client.deep_research(topic, self.config.get("PODCAST_LANGUAGE"), self.news_client); open(summary_file, "w", encoding="utf-8").write(research); self.update_status(0, "✅", 1.0)
+                self.update_status(0, "⏳", 0.2); research = self.google_client.deep_research(topic, self.config.get("PODCAST_LANGUAGE"), self.news_client); open(summary_file, "w", encoding="utf-8").write(research); self.update_status(0, "✅", 1.0)
             elif os.path.exists(summary_file): 
                 research = open(summary_file, "r", encoding="utf-8").read(); self.update_status(0, "☑️", 1.0)
             self._check_stop()
 
-            if "Fact Check Research" in steps_to_run and self.config.get("FACT_CHECK_ENABLED", False):
-                self.update_status(1, "⏳", 0.5); fact_check = self.google_client.fact_check_script(research, self.config.get("PODCAST_LANGUAGE")); self.update_status(1, "✅", 1.0)
-                self._check_stop()
-                if "Revise Research" in steps_to_run:
-                    self.update_status(2, "⏳", 0.5); research = self.google_client.revise_script(research, fact_check); open(summary_file, "w", encoding="utf-8").write(research); self.update_status(2, "✅", 1.0)
-            else: self.update_status(1, "⏭️", 1.0); self.update_status(2, "⏭️", 1.0)
+            if "Fact Check Research" in steps_to_run:
+                if self.config.get("FACT_CHECK_ENABLED", False):
+                    self.update_status(1, "⏳", 0.2); logging.info("Fact-checking the core research...")
+                    fact_check = self.google_client.fact_check_script(research, self.config.get("PODCAST_LANGUAGE")); self.update_status(1, "✅", 1.0)
+                    self._check_stop()
+                    if "Revise Research" in steps_to_run:
+                        self.update_status(2, "⏳", 0.2); logging.info("Revising research based on fact-check...")
+                        research = self.google_client.revise_script(research, fact_check); open(summary_file, "w", encoding="utf-8").write(research); self.update_status(2, "✅", 1.0)
+                else:
+                    logging.info("Fact-checking is disabled. Skipping."); self.update_status(1, "⏭️", 1.0); self.update_status(2, "⏭️", 1.0)
             self._check_stop()
 
             if "Podcast Script" in steps_to_run: 
-                self.update_status(3, "⏳", 0.5); script = self.google_client.generate_podcast_script(topic, research, self.config); open(script_file, "w", encoding="utf-8").write(script); self.update_status(3, "✅", 1.0)
+                self.update_status(3, "⏳", 0.2); script = self.google_client.generate_podcast_script(topic, research, self.config); open(script_file, "w", encoding="utf-8").write(script); self.update_status(3, "✅", 1.0)
             elif os.path.exists(script_file): 
                 script = open(script_file, "r", encoding="utf-8").read(); self.update_status(3, "☑️", 1.0)
             self._check_stop()
 
-            # --- START UPDATED THUMBNAIL LOGIC (FIXES CRASH) ---
-            if "Generate Thumbnail" in steps_to_run and self.config.get("GENERATE_THUMBNAIL", False):
-                self.update_status(4, "⏳", 0.2); 
-                char_photo_path = os.path.join(output_dir, "thumb_char_photo.png")
-                font_path = sanitize_ffmpeg_path(os.path.abspath("assets/font.ttf")) # Requires font.ttf in /assets
-                
-                if not os.path.exists("assets/font.ttf"):
-                    logging.error("Thumbnail generation failed: 'assets/font.ttf' not found.")
-                    raise FileNotFoundError("assets/font.ttf not found. Please add a font file to the assets folder.")
-
-                try:
-                    # 1. Generate only the character prompt
-                    prompts = self.google_client.generate_thumbnail_prompts(topic, topic)
-                    self.update_status(4, "⏳", 0.6)
-                    
-                    # 2. Generate only the character image (using the reliable Vertex function)
-                    self._generate_image_with_vertex(prompts['character_prompt'], char_photo_path)
-                    self._check_stop()
-
-                    # 3. Use ffmpeg to create the text side and stack them
-                    self.update_status(4, "⏳", 0.8)
-                    # Create a clean version of the topic text for display
-                    display_text = topic.upper().replace(":", "-").replace("'", "")
-                    
-                    ffmpeg_cmd = [
-                        "ffmpeg", "-y",
-                        "-i", char_photo_path,                                      # Input 0: The AI photo
-                        "-f", "lavfi", "-i", "color=c=0x0D1129:s=960x1080",          # Input 1: The dark blue background (color from screenshot)
-                        "-filter_complex",
-                        f"[0:v]scale=960:1080,setsar=1[left];"                       # Scale photo to 960x1080
-                        f"[1:v]drawtext=text='{display_text}':fontfile='{font_path}':" # Draw text on blue bg
-                        "fontsize=100:fontcolor=white:x=(w-text_w)/2:y=(h-text_h)/2:"
-                        "box=1:boxcolor=0x22C55E@0.0:boxborderw=20:"                  # Add highlight (like 100% FREE) - 0.0 means transparent
-                        "line_spacing=20:text_align=center[right];"
-                        "[left][right]hstack=inputs=2",                             # Stack them horizontally
-                        "-c:v", "png", image_file
-                    ]
-                    
-                    subprocess.run(ffmpeg_cmd, check=True, capture_output=True, text=True, encoding='utf-8')
-                    self.update_status(4, "✅", 1.0)
-                    
-                except Exception as e: 
-                    logging.error(f"Thumbnail failed: {e}", exc_info=True)
-                    if isinstance(e, subprocess.CalledProcessError):
-                        logging.error(f"FFMPEG Error: {e.stderr.decode('utf-8', errors='ignore')}")
-                    self.update_status(4, "❌", 1.0)
-                    last_error = e
-            else:
-                self.update_status(4, "⏭️", 1.0)
+            # --- Visuals and Audio ---
+            if "Generate Thumbnail" in steps_to_run:
+                if self.config.get("GENERATE_THUMBNAIL", False):
+                    self.update_status(4, "⏳", 0.2); title_text = seo_title or topic
+                    left_path, right_path = os.path.join(output_dir, "thumb_left.png"), os.path.join(output_dir, "thumb_right.png")
+                    try:
+                        prompts = self.google_client.generate_thumbnail_prompts(topic, title_text)
+                        logging.info(f"Character Prompt: {prompts['character_prompt']}")
+                        logging.info(f"Text Prompt: {prompts['text_prompt']}")
+                        self.google_client.gemini_nanobanana_image(prompts['character_prompt'], left_path)
+                        self._check_stop()
+                        self.google_client.gemini_nanobanana_image(prompts['text_prompt'], right_path)
+                        self._check_stop()
+                        ffmpeg_cmd = ["ffmpeg", "-y", "-i", left_path, "-i", right_path, "-filter_complex", "[0:v]scale=960:1080,setsar=1[left];[1:v]scale=960:1080,setsar=1[right];[left][right]hstack=inputs=2", image_file]
+                        subprocess.run(ffmpeg_cmd, check=True, capture_output=True, text=True, encoding='utf-8')
+                        self.update_status(4, "✅", 1.0)
+                    except Exception as e: 
+                        logging.error(f"Thumbnail generation failed: {e}", exc_info=True); self.update_status(4, "❌", 1.0)
+                else: 
+                    logging.info("Thumbnail generation is disabled. Skipping."); self.update_status(4, "⏭️", 1.0)
             self._check_stop()
-            # --- END UPDATED THUMBNAIL LOGIC ---
 
             if "Analyze Tone" in steps_to_run: self.update_status(5, "✅", 1.0)
             
+            if "Audio (TTS)" in steps_to_run:
+                self.update_status(6, "⏳", 0.2); self.google_client.generate_tts(sanitize_for_tts(script), audio_file, self.config); audio_len = self._get_audio_length(audio_file); self.update_status(6, f"✅ {audio_len:.1f}s", 1.0)
+            elif os.path.exists(audio_file):
+                audio_len = self._get_audio_length(audio_file); self.update_status(6, f"☑️ {audio_len:.1f}s", 1.0)
+            
+            # --- Post-Audio Steps ---
             need_timed_images = "Generate Timed Images" in steps_to_run and self.config.get("GENERATE_TIMED_IMAGES", False)
             need_captions = "Create Final Video" in steps_to_run and self.config.get("CAPTION_ENABLED", False)
             need_timestamps = "Generate Timestamps" in steps_to_run and self.config.get("GENERATE_TIMESTAMPS", True)
             
-            if "Audio (TTS)" in steps_to_run:
-                self.update_status(6, "⏳", 0.3); self.google_client.generate_tts(sanitize_for_tts(script), audio_file, self.config); audio_len = self._get_audio_length(audio_file)
-                self.update_status(6, "⏳", 0.6)
-                if (need_timed_images or need_captions or need_timestamps):
+            if (need_timed_images or need_captions or need_timestamps):
+                if not self.word_timestamps_for_images: # Only run if it hasn't been run
                     self.word_timestamps_for_images = generate_captions(audio_file, captions_file if need_captions else None, self.config.get("PODCAST_LANGUAGE"))
-                self.update_status(6, f"✅ {audio_len:.1f}s", 1.0)
-            elif os.path.exists(audio_file):
-                audio_len = self._get_audio_length(audio_file)
-                if (need_timed_images or need_captions or need_timestamps) and not self.word_timestamps_for_images:
-                     self.word_timestamps_for_images = generate_captions(audio_file, captions_file if need_captions else None, self.config.get("PODCAST_LANGUAGE"))
-                self.update_status(6, f"☑️ {audio_len:.1f}s", 1.0)
-            self._check_stop()
 
-            # --- VIDEO GENERATION (STEP 8 - MOVED BEFORE TIMED IMAGES) ---
-            if "Video Generation" in steps_to_run:
-                if not self.config.get("TIMED_IMAGES_AS_SLIDESHOW", False):
-                    self.update_status(7, "⏳", 0.5); aspect = self.config.get("VIDEO_ASPECT_RATIO"); prompt = self.google_client.generate_video_prompt(topic, research, self.config.get("VIDEO_PROMPT_BASE_STYLE"))
-                    try:
-                        if self.config.get("VIDEO_ENGINE") == "Vertex AI (Veo)": 
-                            # This function now correctly points to the Imagen 2 model per api_clients.py update
-                            self.google_client.vertex_ai_text_to_video(prompt, bg_video_file, aspect)
-                        else: 
-                            self.wavespeed_client.text_to_video(prompt, bg_video_file, "832*480" if aspect == "16:9 (Horizontal)" else "480*832")
-                        self.update_status(7, "✅", 1.0)
-                    except Exception as e: 
-                        logging.error(f"Background video generation failed: {e}"); self.update_status(7, "❌", 1.0)
-                else: 
-                    self.update_status(7, "⏭️", 1.0)
-            else:
-                 self.update_status(7, "⏭️", 1.0) # Mark as skipped if not in steps_to_run
-            self._check_stop()
-
-            # --- TIMED IMAGES (STEP 9 - MOVED HERE, RUNS LAST) ---
             if "Generate Timed Images" in steps_to_run:
                 if need_timed_images:
-                    self.update_status(8, "⏳", 0.5); image_interval, image_count = self.config.get("IMAGE_GENERATION_INTERVAL", 10), 0
+                    self.update_status(7, "⏳", 0.2); image_interval, image_count = self.config.get("IMAGE_GENERATION_INTERVAL", 10), 0
                     for i in range(0, int(audio_len), image_interval):
                         segment_text = " ".join([w['word'] for w in self.word_timestamps_for_images if i <= w['start'] < i + image_interval])
                         if not segment_text.strip(): continue
                         image_count += 1; image_output_path = os.path.join(segment_images_dir, f"segment_{image_count:03d}.png")
-                        
-                        # API REDUCTION FIX: Use segment text directly as prompt
-                        image_prompt = f"A cinematic, photorealistic image representing: {topic}, {segment_text}"
-                        
+                        image_prompt = self.google_client.generate_image_prompt_for_segment(self.config.get("CONTENT_STYLE"), topic, segment_text)
                         try: 
-                            # Use the reliable Vertex function
-                            self._generate_image_with_vertex(image_prompt, image_output_path)
-                            generated_images_with_times.append((i, image_output_path))
-                        except Exception as e: 
-                            logging.error(f"Failed to generate timed image {image_count} (prompt: {image_prompt}): {e}")
-                        
-                        self._check_stop()
+                            self.google_client.gemini_nanobanana_image(image_prompt, image_output_path); generated_images_with_times.append((i, image_output_path))
+                        except Exception as e: logging.error(f"Failed to generate image {image_count}: {e}")
                         self._wait()
-                    self.update_status(8, f"✅ {image_count} images", 1.0)
+                    self.update_status(7, f"✅ {image_count} images", 1.0)
                 else: 
-                    logging.info("Timed image generation is disabled. Skipping."); self.update_status(8, "⏭️", 1.0)
-            else:
-                self.update_status(8, "⏭️", 1.0) # Mark as skipped
+                    logging.info("Timed image generation is disabled. Skipping."); self.update_status(7, "⏭️", 1.0)
             self._check_stop()
             
-            # --- FINAL PROCESSING (AUDIO/VIDEO COMBINE) ---
+            if "Video Generation" in steps_to_run:
+                if not self.config.get("TIMED_IMAGES_AS_SLIDESHOW", False):
+                    self.update_status(8, "⏳", 0.2); aspect = self.config.get("VIDEO_ASPECT_RATIO"); prompt = self.google_client.generate_video_prompt(topic, research, self.config.get("VIDEO_PROMPT_BASE_STYLE"))
+                    try:
+                        if self.config.get("VIDEO_ENGINE") == "Vertex AI (Veo)": 
+                            self.google_client.vertex_ai_text_to_video(prompt, bg_video_file, "16:9" if aspect == "16:9 (Horizontal)" else "9:16")
+                        else: 
+                            self.wavespeed_client.text_to_video(prompt, bg_video_file, "832*480" if aspect == "16:9 (Horizontal)" else "480*832")
+                        self.update_status(8, "✅", 1.0)
+                    except Exception as e: 
+                        logging.error(f"Background video generation failed: {e}"); self.update_status(8, "❌", 1.0)
+                else: 
+                    self.update_status(8, "⏭️", 1.0)
+            self._check_stop()
+
             final_audio = audio_file
             if "Add Background Music" in steps_to_run:
                 if self.config.get("ADD_MUSIC", False):
-                    self.update_status(9, "⏳", 0.5); final_audio = mix_audio_with_music(audio_file, "assets/background_music.mp3", mixed_audio_file); self.update_status(9, "✅", 1.0)
+                    self.update_status(9, "⏳", 0.2); final_audio = mix_audio_with_music(audio_file, "assets/background_music.mp3", mixed_audio_file); self.update_status(9, "✅", 1.0)
                 else: 
                     self.update_status(9, "⏭️", 1.0)
             self._check_stop()
 
             if "Create Final Video" in steps_to_run:
-                self.update_status(10, "⏳", 0.5); output_size = "720x1280" if self.config.get("VIDEO_ASPECT_RATIO") == "9:16 (Vertical)" else "1280x720"
+                self.update_status(10, "⏳", 0.2); output_size = "720x1280" if self.config.get("VIDEO_ASPECT_RATIO") == "9:16 (Vertical)" else "1280x720"
                 
                 inputs = []            
                 filter_segments = []   
@@ -458,36 +390,70 @@ class Pipeline:
                 self.update_status(10, "⏭️", 1.0)
             self._check_stop()
 
+            # --- Final Metadata (RUNS BEFORE TIMESTAMPS) ---
             if "Generate SEO Metadata" in steps_to_run:
                 if self.config.get("GENERATE_METADATA", False) and self.update_seo:
-                    self.update_status(11, "⏳", 0.5)
-                    context_for_seo = script if script else research
-                    metadata = self.google_client.generate_seo_metadata(topic, context=context_for_seo)
+                    self.update_status(11, "⏳", 0.2)
+                    metadata = self.google_client.generate_seo_metadata(topic, script) # Use script
                     self.update_seo(metadata)
                     self.update_status(11, "✅", 1.0)
                 else: 
                     self.update_status(11, "⏭️", 1.0)
 
+            # --- Timestamp Generation (RUNS AFTER SEO, TO APPEND) ---
             if "Generate Timestamps" in steps_to_run:
-                if need_timestamps and self.update_timestamps and script:
-                    self.update_status(12, "⏳", 0.5)
+                if need_timestamps and self.update_timestamps:
+                    self.update_status(12, "⏳", 0.2)
+                    logging.info("Generating accurate timestamps locally...")
+                    
+                    # 1. Get chapter titles from AI (fast, small payload)
                     chapter_titles = self.google_client.generate_chapter_titles(script)
-                    timestamps_text = self._get_timestamps_from_titles(chapter_titles, self.word_timestamps_for_images)
-                    if timestamps_text:
-                        self.update_timestamps(timestamps_text)
+                    
+                    if not self.word_timestamps_for_images:
+                        raise ValueError("Word timestamps are missing, cannot generate chapters.")
+                        
+                    # 2. Build a quick-lookup dictionary of the *first* time each word appears
+                    word_map = {}
+                    for word_data in self.word_timestamps_for_images:
+                        word = word_data['word'].strip().lower()
+                        if word not in word_map:
+                            word_map[word] = word_data['start']
+
+                    timestamp_output = "\n\n--- Timestamps ---\n"
+                    found_chapters = 0
+                    
+                    # 3. Match titles locally
+                    for title in chapter_titles:
+                        # Find the first word of the title (e.g., "The Early Days" -> "the")
+                        first_word_of_title = re.sub(r'[^\w]', '', title.split(' ')[0]).strip().lower()
+                        
+                        if first_word_of_title in word_map:
+                            start_seconds = word_map[first_word_of_title]
+                            timestamp_output += f"{format_timestamp(start_seconds)} - {title}\n"
+                            found_chapters += 1
+                        else:
+                            logging.warning(f"Could not find timestamp match for chapter: '{title}' (word: '{first_word_of_title}')")
+
+                    if found_chapters > 0:
+                        self.update_timestamps(timestamp_output)
+                    else:
+                        logging.error("Failed to match any chapter titles to timestamp data.")
+
                     self.update_status(12, "✅", 1.0)
                 else: 
                     self.update_status(12, "⏭️", 1.0)
 
+            # --- Snippets ---
             if "Generate Snippets" in steps_to_run:
                 if self.config.get("GENERATE_SNIPPETS", False):
-                    self.update_status(13, "⏳", 0.5); snippets_dir = os.path.join(output_dir, "snippets"); os.makedirs(snippets_dir, exist_ok=True)
+                    self.update_status(13, "⏳", 0.2); snippets_dir = os.path.join(output_dir, "snippets"); os.makedirs(snippets_dir, exist_ok=True)
                     is_vertical = self.config.get("VIDEO_ASPECT_RATIO", "16:9 (Horizontal)") == "9:16 (Vertical)"
                     for i in range(int(audio_len // 60)):
                         output_snippet_path = os.path.join(snippets_dir, f"snippet_{i+1}.mp4"); start_time = str(i * 60)
                         if is_vertical: 
                             ffmpeg_cmd = ["ffmpeg", "-y", "-i", final_video_file, "-ss", start_time, "-t", "60", "-c", "copy", output_snippet_path]
                         else: 
+                            # FIX for "width not divisible by 2"
                             pan_scan_filter = f"scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280"
                             ffmpeg_cmd = ["ffmpeg", "-y", "-i", final_video_file, "-ss", start_time, "-t", "60", "-vf", pan_scan_filter, "-c:a", "copy", output_snippet_path]
                         subprocess.run(ffmpeg_cmd, check=True, capture_output=True)
@@ -498,29 +464,22 @@ class Pipeline:
             logging.info("✅✅ Pipeline completed successfully! ✅✅")
             success = True
 
-        except (InterruptedError, FileNotFoundError) as e: 
-            if not last_error: last_error = e
-            logging.warning(str(e))
+        except (InterruptedError, FileNotFoundError) as e: logging.warning(str(e))
         except subprocess.CalledProcessError as e: 
-            if not last_error: last_error = e
-            logging.error(f"ffmpeg command failed: {e.stderr.decode('utf-8', errors='ignore') if e.stderr else 'No stderr'}")
+            logging.error(f"ffmpeg command failed with exit code {e.returncode}\nffmpeg stderr:\n{e.stderr.decode('utf-8', errors='ignore') if e.stderr else 'No stderr'}")
             self.update_status_on_error()
         except Exception as e: 
-            if not last_error: last_error = e
             logging.error(f"Pipeline failed: {e}", exc_info=True)
             self.update_status_on_error()
         finally:
-            if self.on_finish: self.on_finish(success, last_error)
+            if self.on_finish: self.on_finish(success)
 
     def update_status_on_error(self):
         """Finds the currently running step and marks it as failed."""
         from main import PIPELINE_STEPS
         for i in range(len(PIPELINE_STEPS)):
-            try:
-                if hasattr(self.update_status, '__self__') and self.update_status.__self__.step_status_labels[i].cget("text") == "⏳":
-                    self.update_status(i, "❌", 1.0); break
-            except Exception:
-                pass
+            if hasattr(self.update_status, '__self__') and self.update_status.__self__.step_status_labels[i].cget("text") == "⏳":
+                self.update_status(i, "❌", 1.0); break
 
     def _extract_voice_name(self, val): 
         return val.split(" — ")[0] if " — " in val else val
